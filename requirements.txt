@@ -1,0 +1,10 @@
+streamlit
+pandas
+openpyxl
+python-docx
+docxtpl
+docxcompose
+Pillow
+pytesseract
+rapidfuzz
+numpy
