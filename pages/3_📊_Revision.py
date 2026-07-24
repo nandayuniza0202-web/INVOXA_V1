@@ -1,515 +1,828 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from services.recommendation_service import recommend_new_products
 from utils.common import CATEGORIES, UNITS, prepare_dataframe, recalculate, rupiah
 
 
-st.set_page_config(page_title="Revision", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="Revision",
+    page_icon="📊",
+    layout="wide",
+)
 
 
 # =========================================================
-# HELPER
+# KONSTANTA
 # =========================================================
+
+DEFAULT_MAX_PRICE_INCREASE = 12.0
+DEFAULT_MAX_QUANTITY_INCREASE = 50.0
+DEFAULT_NEW_PRODUCT_SHARE = 55.0
+DEFAULT_TOLERANCE = 10_000.0
+
+DISPLAY_COLUMNS = [
+    "Kategori",
+    "Nama Nota",
+    "Uraian",
+    "Satuan",
+    "Kuantitas Asli",
+    "Kuantitas Usulan",
+    "Harga Asli",
+    "Harga Usulan",
+    "Jumlah Asli",
+    "Jumlah Usulan",
+    "Sumber",
+    "Kunci",
+]
+
+
+# =========================================================
+# HELPER UMUM
+# =========================================================
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 
 def round_to_step(value: float, step: int) -> float:
-    if step <= 0:
-        return round(float(value))
-    return round(float(value) / step) * step
+    step = max(int(step), 1)
+    return float(round(float(value) / step) * step)
 
 
-def recommended_target(
-    original_total: float,
-    percentage: float,
-    rounding: int = 1000,
-) -> float:
-    """Membuat target otomatis berdasarkan persentase kenaikan."""
-    if original_total <= 0:
-        return 0.0
+def get_current_invoice_id() -> str | None:
+    for key in (
+        "current_invoice_id",
+        "invoice_id",
+        "saved_invoice_id",
+    ):
+        value = st.session_state.get(key)
 
-    raw_target = original_total * (1.0 + percentage / 100.0)
-    return float(round_to_step(raw_target, rounding))
+        if value:
+            return str(value)
 
+    metadata = st.session_state.get("invoice_metadata", {})
 
-def optimize_to_target_band(
-    result: pd.DataFrame,
-    target: float,
-    adjustment_method: str,
-    rounding_step: int,
-    unlocked_indices: list[int],
-    tolerance: float = 10000.0,
-) -> pd.DataFrame:
-    """
-    Cari hasil sedekat mungkin dengan target.
+    if isinstance(metadata, dict) and metadata.get("invoice_id"):
+        return str(metadata["invoice_id"])
 
-    Hasil dianggap valid bila berada dalam rentang:
-    target - tolerance sampai target + tolerance.
-
-    Untuk metode yang mengizinkan perubahan harga, program melakukan
-    koreksi akhir pada satu item agar selisih maksimum Rp10.000.
-    """
-    result = result.copy()
-
-    result["Jumlah Usulan"] = (
-        result["Kuantitas Usulan"] * result["Harga Usulan"]
-    )
-
-    if not unlocked_indices:
-        return result
-
-    # Koreksi bertahap menggunakan langkah harga atau 1 unit kuantitas.
-    for _ in range(100000):
-        current_total = float(result["Jumlah Usulan"].sum())
-        current_gap = abs(target - current_total)
-
-        if current_gap <= tolerance:
-            break
-
-        best_move = None
-        best_gap = current_gap
-
-        for idx in unlocked_indices:
-            qty = float(result.at[idx, "Kuantitas Usulan"])
-            price = float(result.at[idx, "Harga Usulan"])
-
-            if qty <= 0 or price < 0:
-                continue
-
-            # Coba naik/turun harga satu langkah.
-            if adjustment_method in ["Harga saja", "Harga dan kuantitas"]:
-                for direction in (-1, 1):
-                    candidate_price = price + direction * rounding_step
-
-                    if candidate_price < 0:
-                        continue
-
-                    candidate_total = (
-                        current_total
-                        + qty * (candidate_price - price)
-                    )
-                    candidate_gap = abs(target - candidate_total)
-
-                    if candidate_gap < best_gap:
-                        best_gap = candidate_gap
-                        best_move = (
-                            "price",
-                            idx,
-                            candidate_price,
-                        )
-
-            # Coba naik/turun kuantitas satu unit.
-            if adjustment_method in ["Kuantitas saja", "Harga dan kuantitas"]:
-                for direction in (-1, 1):
-                    candidate_qty = qty + direction
-
-                    if candidate_qty < 0:
-                        continue
-
-                    candidate_total = (
-                        current_total
-                        + price * (candidate_qty - qty)
-                    )
-                    candidate_gap = abs(target - candidate_total)
-
-                    if candidate_gap < best_gap:
-                        best_gap = candidate_gap
-                        best_move = (
-                            "qty",
-                            idx,
-                            candidate_qty,
-                        )
-
-        if best_move is None:
-            break
-
-        move_type, idx, new_value = best_move
-
-        if move_type == "price":
-            result.at[idx, "Harga Usulan"] = new_value
-        else:
-            result.at[idx, "Kuantitas Usulan"] = new_value
-
-        result.at[idx, "Jumlah Usulan"] = (
-            float(result.at[idx, "Kuantitas Usulan"])
-            * float(result.at[idx, "Harga Usulan"])
-        )
-
-    # Koreksi akhir yang lebih presisi untuk metode yang mengizinkan harga.
-    # Harga tetap dibulatkan ke kelipatan rounding_step.
-    if adjustment_method in ["Harga saja", "Harga dan kuantitas"]:
-        current_total = float(result["Jumlah Usulan"].sum())
-        current_gap = abs(target - current_total)
-
-        if current_gap > tolerance:
-            best_choice = None
-            best_gap = current_gap
-
-            for idx in unlocked_indices:
-                qty = float(result.at[idx, "Kuantitas Usulan"])
-
-                if qty <= 0:
-                    continue
-
-                current_price = float(result.at[idx, "Harga Usulan"])
-                other_total = current_total - (qty * current_price)
-
-                ideal_price = (target - other_total) / qty
-
-                candidates = {
-                    max(0.0, round_to_step(ideal_price, rounding_step)),
-                    max(
-                        0.0,
-                        round_to_step(
-                            ideal_price - rounding_step,
-                            rounding_step,
-                        ),
-                    ),
-                    max(
-                        0.0,
-                        round_to_step(
-                            ideal_price + rounding_step,
-                            rounding_step,
-                        ),
-                    ),
-                }
-
-                for candidate_price in candidates:
-                    candidate_total = (
-                        other_total + qty * candidate_price
-                    )
-                    candidate_gap = abs(target - candidate_total)
-
-                    if candidate_gap < best_gap:
-                        best_gap = candidate_gap
-                        best_choice = (
-                            idx,
-                            candidate_price,
-                        )
-
-            if best_choice is not None:
-                idx, candidate_price = best_choice
-                result.at[idx, "Harga Usulan"] = candidate_price
-                result.at[idx, "Jumlah Usulan"] = (
-                    float(result.at[idx, "Kuantitas Usulan"])
-                    * candidate_price
-                )
-
-    return result
+    return None
 
 
-def _prepare_simulation_dataframe(source: pd.DataFrame) -> pd.DataFrame:
+def prepare_simulation_source(source: pd.DataFrame) -> pd.DataFrame:
     result = prepare_dataframe(source).copy().reset_index(drop=True)
 
     result["Kuantitas"] = pd.to_numeric(
-        result["Kuantitas"], errors="coerce"
+        result["Kuantitas"],
+        errors="coerce",
     ).fillna(0.0)
 
     result["Harga"] = pd.to_numeric(
-        result["Harga"], errors="coerce"
+        result["Harga"],
+        errors="coerce",
     ).fillna(0.0)
 
-    result["Kunci"] = result["Kunci"].fillna(False).astype(bool)
+    result["Kunci"] = (
+        result["Kunci"]
+        .fillna(False)
+        .astype(bool)
+    )
 
     result["Kuantitas Asli"] = result["Kuantitas"].astype(float)
     result["Harga Asli"] = result["Harga"].astype(float)
-
     result["Kuantitas Usulan"] = result["Kuantitas Asli"].copy()
     result["Harga Usulan"] = result["Harga Asli"].copy()
 
     result["Jumlah Asli"] = (
-        result["Kuantitas Asli"] * result["Harga Asli"]
+        result["Kuantitas Asli"]
+        * result["Harga Asli"]
     )
+
+    result["Jumlah Usulan"] = result["Jumlah Asli"].copy()
+    result["Sumber"] = "Barang Asli"
 
     return result
 
 
-def create_budget_simulation(
-    source: pd.DataFrame,
-    target: float,
-    adjustment_method: str,
-    max_percent: float,
-    rounding_step: int,
-    tolerance: float,
-) -> dict:
-    """
-    Membuat simulasi yang HARUS tepat ke total pagu target.
+def recommendation_rows(
+    recommendations: list[dict[str, Any]],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
 
-    Prinsip:
-    - Seluruh item tidak terkunci disesuaikan secara proporsional.
-    - Kuantitas/harga awal tidak langsung diubah.
-    - Satu item dipakai sebagai item penyeimbang terakhir agar total
-      persis sama dengan target.
-    - Data baru diterapkan setelah tombol Terapkan ditekan.
-    """
-    result = _prepare_simulation_dataframe(source)
-
-    target = float(round(target))
-    rounding_step = max(int(rounding_step), 1)
-
-    original_total = float(result["Jumlah Asli"].sum())
-
-    unlocked_mask = (
-        (~result["Kunci"])
-        & (result["Kuantitas Asli"] > 0)
-        & (result["Harga Asli"] > 0)
-    )
-
-    unlocked_indices = list(result.index[unlocked_mask])
-
-    if original_total <= 0 or not unlocked_indices:
-        result["Jumlah Usulan"] = result["Jumlah Asli"]
-        result["Persentase Harga"] = 0.0
-        result["Persentase Kuantitas"] = 0.0
-
-        return {
-            "dataframe": result,
-            "original_total": original_total,
-            "revised_total": original_total,
-            "target": target,
-            "difference": abs(target - original_total),
-            "reached": False,
-            "message": "Tidak ada item yang dapat disesuaikan.",
-            "required_percent": 0.0,
-        }
-
-    locked_total = float(
-        result.loc[~unlocked_mask, "Jumlah Asli"].sum()
-    )
-
-    unlocked_original_total = float(
-        result.loc[unlocked_mask, "Jumlah Asli"].sum()
-    )
-
-    target_for_unlocked = target - locked_total
-
-    if target_for_unlocked <= 0:
-        result["Jumlah Usulan"] = result["Jumlah Asli"]
-        result["Persentase Harga"] = 0.0
-        result["Persentase Kuantitas"] = 0.0
-
-        return {
-            "dataframe": result,
-            "original_total": original_total,
-            "revised_total": original_total,
-            "target": target,
-            "difference": abs(target - original_total),
-            "reached": False,
-            "message": (
-                "Total item terkunci sudah sama dengan atau melebihi pagu target. "
-                "Buka kunci sebagian item agar program dapat menyesuaikan."
-            ),
-            "required_percent": 0.0,
-        }
-
-    factor = target_for_unlocked / unlocked_original_total
-    required_percent = (factor - 1.0) * 100.0
-
-    # -----------------------------------------------------
-    # TAHAP 1: penyesuaian proporsional seluruh item
-    # -----------------------------------------------------
-    for idx in unlocked_indices:
-        original_qty = float(result.at[idx, "Kuantitas Asli"])
-        original_price = float(result.at[idx, "Harga Asli"])
-
-        if adjustment_method == "Harga saja":
-            proposed_qty = original_qty
-            proposed_price = round_to_step(
-                original_price * factor,
-                rounding_step,
-            )
-
-        elif adjustment_method == "Kuantitas saja":
-            proposed_qty = max(
-                1.0,
-                float(round(original_qty * factor)),
-            )
-            proposed_price = original_price
-
-        else:
-            split_factor = factor ** 0.5
-
-            proposed_qty = max(
-                1.0,
-                float(round(original_qty * split_factor)),
-            )
-
-            proposed_price = round_to_step(
-                original_price * split_factor,
-                rounding_step,
-            )
-
-        if proposed_price <= 0:
-            proposed_price = rounding_step
-
-        result.at[idx, "Kuantitas Usulan"] = proposed_qty
-        result.at[idx, "Harga Usulan"] = proposed_price
-
-    result["Jumlah Usulan"] = (
-        result["Kuantitas Usulan"]
-        * result["Harga Usulan"]
-    )
-
-    # -----------------------------------------------------
-    # TAHAP 2: pilih satu item penyeimbang agar total PERSIS
-    # -----------------------------------------------------
-    best_solution = None
-
-    for idx in unlocked_indices:
-        current_qty = int(
-            max(
-                1,
-                round(float(result.at[idx, "Kuantitas Usulan"])),
-            )
+    for item in recommendations:
+        price = safe_float(
+            item.get("suggested_unit_price")
+            or item.get("average_price")
         )
 
-        original_qty = max(
-            1,
-            int(round(float(result.at[idx, "Kuantitas Asli"]))),
-        )
-
-        original_price = max(
-            1.0,
-            float(result.at[idx, "Harga Asli"]),
-        )
-
-        other_total = float(
-            result["Jumlah Usulan"].sum()
-            - result.at[idx, "Jumlah Usulan"]
-        )
-
-        remainder = int(round(target - other_total))
-
-        if remainder <= 0:
+        if price <= 0:
             continue
 
-        qty_candidates = {1, current_qty, original_qty}
-
-        # Cari kuantitas sekitar kuantitas asli/usulan yang memungkinkan
-        # harga bulat rupiah dan total tepat ke pagu.
-        max_search = max(
-            200,
-            current_qty + 100,
-            original_qty + 100,
+        quantity = max(
+            1.0,
+            safe_float(item.get("suggested_quantity"), 1.0),
         )
 
-        for qty in range(1, max_search + 1):
-            qty_candidates.add(qty)
-
-        for qty in qty_candidates:
-            if qty <= 0:
-                continue
-
-            if remainder % qty != 0:
-                continue
-
-            price = remainder // qty
-
-            if price <= 0:
-                continue
-
-            # Nilai skor digunakan agar perubahan item penyeimbang
-            # tetap sedekat mungkin dengan data awal.
-            qty_change = abs(qty - original_qty) / max(original_qty, 1)
-            price_change = abs(price - original_price) / max(original_price, 1)
-            score = qty_change + price_change
-
-            if adjustment_method == "Harga saja" and qty != original_qty:
-                continue
-
-            if adjustment_method == "Kuantitas saja" and price != int(round(original_price)):
-                continue
-
-            candidate = {
-                "idx": idx,
-                "qty": float(qty),
-                "price": float(price),
-                "score": score,
+        rows.append(
+            {
+                "Uraian": str(
+                    item.get("product_name")
+                    or "Barang Database"
+                ),
+                "Kuantitas": quantity,
+                "Satuan": str(item.get("unit") or "pcs"),
+                "Harga": price,
+                "Jumlah": quantity * price,
+                "Kategori": str(
+                    item.get("category")
+                    or "Belum Dikategorikan"
+                ),
+                "Nama Nota": "Rekomendasi Database",
+                "Kunci": False,
+                "Kuantitas Asli": 0.0,
+                "Harga Asli": price,
+                "Kuantitas Usulan": quantity,
+                "Harga Usulan": price,
+                "Jumlah Asli": 0.0,
+                "Jumlah Usulan": quantity * price,
+                "Sumber": "Barang Baru Database",
+                "Product ID": item.get("product_id"),
+                "Skor Rekomendasi": safe_float(item.get("score")),
+                "Alasan": str(item.get("reason") or ""),
             }
-
-            if best_solution is None or score < best_solution["score"]:
-                best_solution = candidate
-
-    # Untuk menjamin tepat ke target, mode Harga dan kuantitas
-    # boleh memakai qty 1 pada satu item penyeimbang.
-    if best_solution is None and adjustment_method == "Harga dan kuantitas":
-        for idx in unlocked_indices:
-            other_total = float(
-                result["Jumlah Usulan"].sum()
-                - result.at[idx, "Jumlah Usulan"]
-            )
-
-            remainder = int(round(target - other_total))
-
-            if remainder > 0:
-                best_solution = {
-                    "idx": idx,
-                    "qty": 1.0,
-                    "price": float(remainder),
-                    "score": float("inf"),
-                }
-                break
-
-    if best_solution is not None:
-        idx = best_solution["idx"]
-
-        result.at[idx, "Kuantitas Usulan"] = best_solution["qty"]
-        result.at[idx, "Harga Usulan"] = best_solution["price"]
-        result.at[idx, "Jumlah Usulan"] = (
-            best_solution["qty"]
-            * best_solution["price"]
         )
 
-    result["Jumlah Usulan"] = (
-        result["Kuantitas Usulan"]
-        * result["Harga Usulan"]
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+def add_database_products(
+    result: pd.DataFrame,
+    recommendations: list[dict[str, Any]],
+    gap: float,
+    share_percent: float,
+    max_new_products: int,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Prioritas pertama:
+    masukkan barang lain dari database sampai porsi tertentu dari selisih.
+    """
+
+    messages: list[str] = []
+
+    if gap <= 0 or not recommendations:
+        return result, messages
+
+    target_for_new_products = gap * max(
+        0.0,
+        min(float(share_percent), 100.0),
+    ) / 100.0
+
+    candidates = recommendation_rows(recommendations)
+
+    if candidates.empty:
+        return result, messages
+
+    used_names = {
+        str(value).strip().lower()
+        for value in result["Uraian"].tolist()
+    }
+
+    selected_rows: list[dict[str, Any]] = []
+    added_total = 0.0
+
+    candidates = candidates.sort_values(
+        by=[
+            "Skor Rekomendasi",
+            "Jumlah Usulan",
+        ],
+        ascending=[
+            False,
+            True,
+        ],
     )
 
+    for _, candidate in candidates.iterrows():
+        if len(selected_rows) >= max_new_products:
+            break
+
+        name = str(candidate["Uraian"]).strip()
+        normalized_name = name.lower()
+
+        if not name or normalized_name in used_names:
+            continue
+
+        unit_price = safe_float(candidate["Harga Usulan"])
+
+        if unit_price <= 0:
+            continue
+
+        remaining = max(target_for_new_products - added_total, 0.0)
+
+        if remaining <= 0:
+            break
+
+        suggested_quantity = max(
+            1,
+            min(
+                int(math.floor(remaining / unit_price)),
+                int(max(safe_float(candidate["Kuantitas Usulan"]), 1)),
+                10,
+            ),
+        )
+
+        candidate = candidate.copy()
+        candidate["Kuantitas"] = float(suggested_quantity)
+        candidate["Kuantitas Usulan"] = float(suggested_quantity)
+        candidate["Jumlah"] = (
+            float(suggested_quantity)
+            * unit_price
+        )
+        candidate["Jumlah Usulan"] = candidate["Jumlah"]
+
+        if candidate["Jumlah Usulan"] > gap:
+            continue
+
+        selected_rows.append(candidate.to_dict())
+        used_names.add(normalized_name)
+        added_total += safe_float(candidate["Jumlah Usulan"])
+
+    if selected_rows:
+        result = pd.concat(
+            [
+                result,
+                pd.DataFrame(selected_rows),
+            ],
+            ignore_index=True,
+            sort=False,
+        )
+
+        messages.append(
+            f"{len(selected_rows)} barang baru dari database "
+            f"ditambahkan dengan nilai {rupiah(added_total)}."
+        )
+
+    return result, messages
+
+
+def increase_quantities(
+    result: pd.DataFrame,
+    target: float,
+    max_quantity_increase: float,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Prioritas kedua:
+    naikkan kuantitas barang lama secara terbatas.
+    """
+
+    messages: list[str] = []
+
+    current_total = float(result["Jumlah Usulan"].sum())
+    gap = target - current_total
+
+    if gap <= 0:
+        return result, messages
+
+    eligible = result[
+        (~result["Kunci"])
+        & (result["Harga Usulan"] > 0)
+        & (result["Kuantitas Usulan"] > 0)
+    ].copy()
+
+    if eligible.empty:
+        return result, messages
+
+    eligible["Harga Prioritas"] = eligible["Harga Usulan"]
+    eligible = eligible.sort_values(
+        by=[
+            "Sumber",
+            "Harga Prioritas",
+        ],
+        ascending=[
+            True,
+            True,
+        ],
+    )
+
+    total_added = 0.0
+    changed_items = 0
+
+    for idx in eligible.index:
+        if gap <= 0:
+            break
+
+        current_qty = safe_float(
+            result.at[idx, "Kuantitas Usulan"]
+        )
+        original_qty = safe_float(
+            result.at[idx, "Kuantitas Asli"]
+        )
+        unit_price = safe_float(
+            result.at[idx, "Harga Usulan"]
+        )
+
+        if current_qty <= 0 or unit_price <= 0:
+            continue
+
+        baseline_qty = max(original_qty, current_qty, 1.0)
+
+        max_qty = max(
+            current_qty,
+            math.floor(
+                baseline_qty
+                * (
+                    1.0
+                    + max_quantity_increase / 100.0
+                )
+            ),
+        )
+
+        possible_addition = int(
+            max_qty - current_qty
+        )
+
+        affordable_addition = int(
+            gap // unit_price
+        )
+
+        addition = min(
+            possible_addition,
+            affordable_addition,
+        )
+
+        if addition <= 0:
+            continue
+
+        new_qty = current_qty + addition
+        result.at[idx, "Kuantitas Usulan"] = new_qty
+        result.at[idx, "Jumlah Usulan"] = (
+            new_qty * unit_price
+        )
+
+        nominal = addition * unit_price
+        total_added += nominal
+        gap -= nominal
+        changed_items += 1
+
+    if changed_items:
+        messages.append(
+            f"Kuantitas {changed_items} barang dinaikkan "
+            f"dengan tambahan {rupiah(total_added)}."
+        )
+
+    return result, messages
+
+
+def increase_prices(
+    result: pd.DataFrame,
+    target: float,
+    max_price_increase: float,
+    rounding_step: int,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Prioritas ketiga:
+    naikkan harga secara terbatas, bukan proporsional tanpa batas.
+    """
+
+    messages: list[str] = []
+
+    current_total = float(result["Jumlah Usulan"].sum())
+    gap = target - current_total
+
+    if gap <= 0:
+        return result, messages
+
+    eligible = result[
+        (~result["Kunci"])
+        & (result["Harga Usulan"] > 0)
+        & (result["Kuantitas Usulan"] > 0)
+    ].copy()
+
+    if eligible.empty:
+        return result, messages
+
+    eligible["Potensi Maksimal"] = (
+        eligible["Kuantitas Usulan"]
+        * eligible["Harga Usulan"]
+        * max_price_increase
+        / 100.0
+    )
+
+    eligible = eligible.sort_values(
+        by="Potensi Maksimal",
+        ascending=False,
+    )
+
+    total_added = 0.0
+    changed_items = 0
+
+    for idx in eligible.index:
+        if gap <= 0:
+            break
+
+        qty = safe_float(
+            result.at[idx, "Kuantitas Usulan"]
+        )
+        original_price = safe_float(
+            result.at[idx, "Harga Asli"]
+        )
+        current_price = safe_float(
+            result.at[idx, "Harga Usulan"]
+        )
+
+        if qty <= 0 or current_price <= 0:
+            continue
+
+        reference_price = max(
+            original_price,
+            current_price,
+        )
+
+        max_allowed_price = round_to_step(
+            reference_price
+            * (
+                1.0
+                + max_price_increase / 100.0
+            ),
+            rounding_step,
+        )
+
+        max_allowed_price = max(
+            max_allowed_price,
+            current_price,
+        )
+
+        ideal_increment = gap / qty
+
+        candidate_price = round_to_step(
+            min(
+                current_price + ideal_increment,
+                max_allowed_price,
+            ),
+            rounding_step,
+        )
+
+        candidate_price = max(
+            current_price,
+            min(candidate_price, max_allowed_price),
+        )
+
+        nominal = (
+            candidate_price - current_price
+        ) * qty
+
+        if nominal <= 0:
+            continue
+
+        result.at[idx, "Harga Usulan"] = candidate_price
+        result.at[idx, "Jumlah Usulan"] = (
+            qty * candidate_price
+        )
+
+        total_added += nominal
+        gap -= nominal
+        changed_items += 1
+
+    if changed_items:
+        messages.append(
+            f"Harga {changed_items} barang dinaikkan secara terbatas "
+            f"dengan tambahan {rupiah(total_added)}."
+        )
+
+    return result, messages
+
+
+def precise_balance(
+    result: pd.DataFrame,
+    target: float,
+    max_price_increase: float,
+    max_quantity_increase: float,
+    rounding_step: int,
+    tolerance: float,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Koreksi akhir tanpa melampaui batas harga/kuantitas.
+
+    Program mencoba:
+    1. Tambah satuan barang yang harganya paling dekat dengan sisa.
+    2. Koreksi harga terbatas pada satu item.
+    """
+
+    current_total = float(result["Jumlah Usulan"].sum())
+    gap = target - current_total
+
+    if abs(gap) <= tolerance:
+        return result, (
+            "Sisa sudah berada dalam batas toleransi."
+        )
+
+    if gap <= 0:
+        return result, (
+            "Total sudah mencapai atau melebihi target."
+        )
+
+    best_move: dict[str, Any] | None = None
+    best_gap = abs(gap)
+
+    for idx in result.index:
+        if bool(result.at[idx, "Kunci"]):
+            continue
+
+        qty = safe_float(
+            result.at[idx, "Kuantitas Usulan"]
+        )
+        price = safe_float(
+            result.at[idx, "Harga Usulan"]
+        )
+        original_qty = safe_float(
+            result.at[idx, "Kuantitas Asli"]
+        )
+        original_price = safe_float(
+            result.at[idx, "Harga Asli"]
+        )
+
+        if qty <= 0 or price <= 0:
+            continue
+
+        # Kandidat penambahan kuantitas.
+        baseline_qty = max(
+            original_qty,
+            qty,
+            1.0,
+        )
+
+        max_qty = math.floor(
+            baseline_qty
+            * (
+                1.0
+                + max_quantity_increase / 100.0
+            )
+        )
+
+        if qty + 1 <= max_qty:
+            candidate_total = current_total + price
+            candidate_gap = abs(target - candidate_total)
+
+            if candidate_gap < best_gap:
+                best_gap = candidate_gap
+                best_move = {
+                    "type": "quantity",
+                    "idx": idx,
+                    "value": qty + 1,
+                }
+
+        # Kandidat koreksi harga.
+        reference_price = max(
+            original_price,
+            price,
+        )
+
+        max_price = round_to_step(
+            reference_price
+            * (
+                1.0
+                + max_price_increase / 100.0
+            ),
+            rounding_step,
+        )
+
+        ideal_price = (
+            price + gap / qty
+        )
+
+        for candidate_price in {
+            round_to_step(
+                ideal_price,
+                rounding_step,
+            ),
+            round_to_step(
+                ideal_price - rounding_step,
+                rounding_step,
+            ),
+            round_to_step(
+                ideal_price + rounding_step,
+                rounding_step,
+            ),
+        }:
+            if (
+                candidate_price < price
+                or candidate_price > max_price
+            ):
+                continue
+
+            candidate_total = (
+                current_total
+                + qty
+                * (
+                    candidate_price - price
+                )
+            )
+
+            candidate_gap = abs(
+                target - candidate_total
+            )
+
+            if candidate_gap < best_gap:
+                best_gap = candidate_gap
+                best_move = {
+                    "type": "price",
+                    "idx": idx,
+                    "value": candidate_price,
+                }
+
+    if best_move:
+        idx = best_move["idx"]
+
+        if best_move["type"] == "quantity":
+            result.at[idx, "Kuantitas Usulan"] = (
+                best_move["value"]
+            )
+        else:
+            result.at[idx, "Harga Usulan"] = (
+                best_move["value"]
+            )
+
+        result.at[idx, "Jumlah Usulan"] = (
+            safe_float(
+                result.at[idx, "Kuantitas Usulan"]
+            )
+            * safe_float(
+                result.at[idx, "Harga Usulan"]
+            )
+        )
+
+        return result, (
+            "Penyesuaian akhir diterapkan tanpa melampaui batas."
+        )
+
+    return result, (
+        "Tidak ada penyesuaian tambahan yang masih berada "
+        "dalam batas harga dan kuantitas."
+    )
+
+
+def build_automatic_database_simulation(
+    source: pd.DataFrame,
+    invoice_id: str,
+    target: float,
+    max_price_increase: float,
+    max_quantity_increase: float,
+    new_product_share: float,
+    max_new_products: int,
+    rounding_step: int,
+    tolerance: float,
+) -> dict[str, Any]:
+    """
+    Urutan otomatis:
+    1. Tambah barang baru dari database.
+    2. Naikkan kuantitas secara terbatas.
+    3. Naikkan harga secara terbatas.
+    4. Koreksi akhir.
+    """
+
+    result = prepare_simulation_source(source)
+    original_total = float(
+        result["Jumlah Asli"].sum()
+    )
+
+    target = float(round(target))
+
+    messages: list[str] = []
+
+    try:
+        recommendations = recommend_new_products(
+            invoice_id=invoice_id,
+            limit=max(max_new_products * 3, 10),
+        )
+    except Exception as error:
+        recommendations = []
+        messages.append(
+            f"Rekomendasi database belum dapat dibaca: {error}"
+        )
+
+    gap = target - float(
+        result["Jumlah Usulan"].sum()
+    )
+
+    result, addition_messages = add_database_products(
+        result=result,
+        recommendations=recommendations,
+        gap=gap,
+        share_percent=new_product_share,
+        max_new_products=max_new_products,
+    )
+    messages.extend(addition_messages)
+
+    result, quantity_messages = increase_quantities(
+        result=result,
+        target=target,
+        max_quantity_increase=max_quantity_increase,
+    )
+    messages.extend(quantity_messages)
+
+    result, price_messages = increase_prices(
+        result=result,
+        target=target,
+        max_price_increase=max_price_increase,
+        rounding_step=rounding_step,
+    )
+    messages.extend(price_messages)
+
+    for _ in range(100):
+        current_total = float(
+            result["Jumlah Usulan"].sum()
+        )
+
+        if abs(target - current_total) <= tolerance:
+            break
+
+        previous_total = current_total
+
+        result, balance_message = precise_balance(
+            result=result,
+            target=target,
+            max_price_increase=max_price_increase,
+            max_quantity_increase=max_quantity_increase,
+            rounding_step=rounding_step,
+            tolerance=tolerance,
+        )
+
+        current_total = float(
+            result["Jumlah Usulan"].sum()
+        )
+
+        if current_total == previous_total:
+            messages.append(balance_message)
+            break
+
+    revised_total = float(
+        result["Jumlah Usulan"].sum()
+    )
+
+    difference = target - revised_total
+
     result["Persentase Harga"] = 0.0
-    harga_nonzero = result["Harga Asli"] > 0
+
+    original_price_mask = result["Harga Asli"] > 0
 
     result.loc[
-        harga_nonzero,
+        original_price_mask,
         "Persentase Harga",
     ] = (
         (
-            result.loc[harga_nonzero, "Harga Usulan"]
-            / result.loc[harga_nonzero, "Harga Asli"]
+            result.loc[
+                original_price_mask,
+                "Harga Usulan",
+            ]
+            / result.loc[
+                original_price_mask,
+                "Harga Asli",
+            ]
         )
         - 1.0
     ) * 100.0
 
     result["Persentase Kuantitas"] = 0.0
-    qty_nonzero = result["Kuantitas Asli"] > 0
+
+    original_qty_mask = result["Kuantitas Asli"] > 0
 
     result.loc[
-        qty_nonzero,
+        original_qty_mask,
         "Persentase Kuantitas",
     ] = (
         (
-            result.loc[qty_nonzero, "Kuantitas Usulan"]
-            / result.loc[qty_nonzero, "Kuantitas Asli"]
+            result.loc[
+                original_qty_mask,
+                "Kuantitas Usulan",
+            ]
+            / result.loc[
+                original_qty_mask,
+                "Kuantitas Asli",
+            ]
         )
         - 1.0
     ) * 100.0
 
-    revised_total = float(result["Jumlah Usulan"].sum())
-    difference = abs(target - revised_total)
-    reached = difference == 0
-
-    if reached:
-        message = (
-            "Simulasi berhasil tepat sama dengan total pagu target. "
-            "Data asli belum berubah sampai hasil diterapkan."
-        )
-    else:
-        message = (
-            "Program belum dapat mencapai total pagu secara tepat dengan metode "
-            "yang dipilih. Gunakan metode 'Harga dan kuantitas' agar program "
-            "dapat membuat item penyeimbang."
-        )
+    reached = abs(difference) <= tolerance
 
     return {
         "dataframe": result,
@@ -518,8 +831,13 @@ def create_budget_simulation(
         "target": target,
         "difference": difference,
         "reached": reached,
-        "message": message,
-        "required_percent": required_percent,
+        "recommendation_count": len(recommendations),
+        "messages": messages,
+        "max_price_increase": max_price_increase,
+        "max_quantity_increase": max_quantity_increase,
+        "new_product_share": new_product_share,
+        "rounding_step": rounding_step,
+        "tolerance": tolerance,
     }
 
 
@@ -530,34 +848,58 @@ def create_budget_simulation(
 if "invoice_items" not in st.session_state:
     st.session_state.invoice_items = []
 
-if "budget_simulation" not in st.session_state:
-    st.session_state.budget_simulation = None
-
 if "global_budget_simulation" not in st.session_state:
     st.session_state.global_budget_simulation = None
+
+if "budget_simulation" not in st.session_state:
+    st.session_state.budget_simulation = None
 
 
 # =========================================================
 # JUDUL DAN VALIDASI
 # =========================================================
 
-st.title("📊 Revision — Budget Adjustment")
+st.title("📊 Revision — Smart Budget Adjustment")
 
 st.caption(
-    "Pilih simulasi otomatis seluruh kategori atau revisi manual per kategori. "
-    "Data asli tidak berubah sebelum hasil diterapkan."
+    "INVOXA memprioritaskan barang baru dari database, "
+    "kemudian menaikkan kuantitas, dan terakhir menaikkan "
+    "harga secara terbatas agar target pagu tercapai."
 )
 
 st.divider()
 
 if not st.session_state.invoice_items:
-    st.warning("Belum ada data. Mulai dari halaman Input Nota.")
+    st.warning(
+        "Belum ada data. Mulai dari halaman Input Nota."
+    )
     st.stop()
 
-all_items = prepare_dataframe(st.session_state.invoice_items)
-grand_total = float(all_items["Jumlah"].sum())
+invoice_id = get_current_invoice_id()
 
-backup_csv = all_items.to_csv(index=False).encode("utf-8-sig")
+if not invoice_id:
+    st.error(
+        "ID invoice tidak ditemukan. Kembali ke Input Nota, "
+        "simpan ulang data, lalu lanjutkan melalui Matching."
+    )
+    st.stop()
+
+all_items = prepare_dataframe(
+    st.session_state.invoice_items
+)
+
+grand_total = float(
+    all_items["Jumlah"].sum()
+)
+
+target_budget = safe_float(
+    st.session_state.get("target_budget"),
+    grand_total,
+)
+
+backup_csv = all_items.to_csv(
+    index=False,
+).encode("utf-8-sig")
 
 st.download_button(
     "⬇️ Download Backup Data Sebelum Revisi",
@@ -569,7 +911,7 @@ st.download_button(
 
 
 # =========================================================
-# PILIH MODE UTAMA — DITAMPILKAN PALING ATAS
+# PILIH MODE
 # =========================================================
 
 st.divider()
@@ -578,334 +920,580 @@ st.subheader("Pilih Cara Revisi")
 revision_mode = st.radio(
     "Mau melakukan revisi bagaimana?",
     [
-        "🚀 Otomatis — Simulasikan Semua Kategori",
-        "✏️ Manual — Revisi Per Kategori",
+        "🚀 Otomatis Cerdas dari Database",
+        "✏️ Manual Per Kategori",
     ],
     horizontal=True,
     index=0,
 )
 
-TOLERANCE = 10_000.0
-
 
 # =========================================================
-# MODE OTOMATIS SELURUH KATEGORI
+# MODE OTOMATIS
 # =========================================================
 
-if revision_mode == "🚀 Otomatis — Simulasikan Semua Kategori":
+if revision_mode == "🚀 Otomatis Cerdas dari Database":
     st.info(
-        "Program akan menyesuaikan seluruh kategori sekaligus agar total akhir "
-        "mendekati total pagu. Selisih maksimal yang diizinkan adalah Rp10.000."
+        "Urutan penyesuaian: barang baru dari database → "
+        "kuantitas → harga. Harga tidak akan dinaikkan "
+        "melewati batas yang kamu tentukan."
     )
 
-    st.subheader("1. Tentukan Total Pagu Keseluruhan")
+    st.subheader("1. Target Pagu")
 
-    target_mode = st.radio(
-        "Cara menentukan total pagu",
-        [
-            "Isi pagu manual",
-            "Rekomendasi otomatis",
-        ],
-        horizontal=True,
-        key="global_target_mode",
+    total_target = st.number_input(
+        "Total pagu keseluruhan",
+        min_value=0.0,
+        value=float(
+            target_budget
+            or grand_total
+        ),
+        step=100_000.0,
     )
 
-    if target_mode == "Isi pagu manual":
-        total_target = st.number_input(
-            "Masukkan total pagu seluruh kategori",
-            min_value=0.0,
-            value=float(
-                st.session_state.get(
-                    "target_budget",
-                    grand_total,
-                )
-                or grand_total
+    st.subheader("2. Batas Penyesuaian")
+
+    setting_1, setting_2 = st.columns(2)
+
+    with setting_1:
+        max_price_increase = st.slider(
+            "Maksimal kenaikan harga per barang",
+            min_value=0,
+            max_value=30,
+            value=int(
+                DEFAULT_MAX_PRICE_INCREASE
             ),
-            step=100_000.0,
-            key="global_total_target",
-        )
-    else:
-        safe_target = recommended_target(grand_total, 10.0)
-        ideal_target = recommended_target(grand_total, 20.0)
-        maximum_target = recommended_target(grand_total, 30.0)
-
-        recommendation = st.radio(
-            "Pilih rekomendasi program",
-            [
-                "Aman · Naik 10%",
-                "Ideal · Naik 20%",
-                "Maksimal · Naik 30%",
-            ],
-            horizontal=True,
-            index=1,
-            key="global_recommendation",
+            step=1,
+            format="%d%%",
+            help=(
+                "Harga satuan tidak boleh melewati "
+                "persentase ini dari harga awal."
+            ),
         )
 
-        if recommendation.startswith("Aman"):
-            total_target = safe_target
-        elif recommendation.startswith("Ideal"):
-            total_target = ideal_target
-        else:
-            total_target = maximum_target
-
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Aman · 10%", rupiah(safe_target))
-        r2.metric("Ideal · 20%", rupiah(ideal_target))
-        r3.metric("Maksimal · 30%", rupiah(maximum_target))
-
-    st.subheader("2. Pengaturan Simulasi")
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        adjustment_method = st.radio(
-            "Yang boleh diubah oleh program",
-            [
-                "Harga saja",
-                "Kuantitas saja",
-                "Harga dan kuantitas",
-            ],
-            index=2,
-            key="global_adjustment_method",
+        new_product_share = st.slider(
+            "Porsi selisih untuk barang baru",
+            min_value=0,
+            max_value=100,
+            value=int(
+                DEFAULT_NEW_PRODUCT_SHARE
+            ),
+            step=5,
+            format="%d%%",
+            help=(
+                "Semakin besar nilainya, semakin banyak "
+                "selisih ditutup dengan barang baru."
+            ),
         )
 
-    with c2:
-        rounding_step = st.selectbox(
-            "Pembulatan harga",
-            [100, 500, 1000, 5000],
-            index=1,
-            disabled=adjustment_method == "Kuantitas saja",
-            key="global_rounding_step",
+    with setting_2:
+        max_quantity_increase = st.slider(
+            "Maksimal kenaikan kuantitas",
+            min_value=0,
+            max_value=200,
+            value=int(
+                DEFAULT_MAX_QUANTITY_INCREASE
+            ),
+            step=10,
+            format="%d%%",
         )
 
-
-    if adjustment_method != "Harga dan kuantitas":
-        st.warning(
-            "Untuk menjamin total tepat sama dengan pagu, gunakan metode "
-            "'Harga dan kuantitas'. Metode lain mungkin tidak memiliki kombinasi yang tepat."
-        )
-    else:
-        st.info(
-            "Program akan menyesuaikan semua item, lalu memakai satu item sebagai "
-            "penyeimbang akhir agar total tepat sama dengan pagu."
+        max_new_products = st.number_input(
+            "Maksimal jenis barang baru",
+            min_value=0,
+            max_value=30,
+            value=8,
+            step=1,
         )
 
-    max_percent = 500.0
-
-    g1, g2, g3 = st.columns(3)
-    g1.metric("Total Saat Ini", rupiah(grand_total))
-    g2.metric("Total Pagu Target", rupiah(total_target))
-    g3.metric(
-        "Nominal yang Harus Disesuaikan",
-        rupiah(abs(float(total_target) - grand_total)),
+    rounding_step = st.selectbox(
+        "Pembulatan harga",
+        options=[
+            100,
+            500,
+            1000,
+            5000,
+        ],
+        index=1,
     )
 
-    st.caption(
-        "Tolak ukur simulasi adalah total pagu target, bukan persentase. "
-        "Hasil hanya dapat diterapkan jika Total Usulan tepat sama dengan Total Pagu."
+    tolerance = st.number_input(
+        "Toleransi selisih akhir",
+        min_value=0.0,
+        value=float(DEFAULT_TOLERANCE),
+        step=1000.0,
+        help=(
+            "Hasil dianggap tercapai bila selisih berada "
+            "dalam nilai toleransi ini."
+        ),
     )
 
-    if st.button(
-        "📊 Simulasikan Semua Kategori Sekaligus",
+    metric_1, metric_2, metric_3 = st.columns(3)
+
+    metric_1.metric(
+        "Total Saat Ini",
+        rupiah(grand_total),
+    )
+
+    metric_2.metric(
+        "Target Pagu",
+        rupiah(total_target),
+    )
+
+    metric_3.metric(
+        "Selisih Awal",
+        rupiah(
+            float(total_target) - grand_total
+        ),
+    )
+
+    run_button = st.button(
+        "🤖 Buat Simulasi Otomatis dari Database",
         type="primary",
         use_container_width=True,
-        key="run_global_simulation",
-    ):
-        result = create_budget_simulation(
-            source=all_items,
-            target=float(total_target),
-            adjustment_method=adjustment_method,
-            max_percent=float(max_percent),
-            rounding_step=int(rounding_step),
-            tolerance=TOLERANCE,
-        )
+    )
 
-        st.session_state.global_budget_simulation = {
-            "data": result["dataframe"].to_dict("records"),
-            "original_total": result["original_total"],
-            "revised_total": result["revised_total"],
-            "target": result["target"],
-            "difference": result["difference"],
-            "reached": result["reached"],
-            "message": result["message"],
-            "required_percent": result["required_percent"],
-            "adjustment_method": adjustment_method,
-            "rounding_step": int(rounding_step),
-        }
+    if run_button:
+        if total_target <= 0:
+            st.error(
+                "Target pagu harus lebih dari nol."
+            )
 
-        st.rerun()
+        elif total_target < grand_total:
+            st.error(
+                "Target pagu lebih kecil dari total saat ini. "
+                "Fitur otomatis ini dirancang untuk menambah "
+                "barang, kuantitas, atau harga."
+            )
 
-    simulation = st.session_state.get("global_budget_simulation")
+        else:
+            with st.spinner(
+                "Mengambil rekomendasi database dan "
+                "menyusun simulasi..."
+            ):
+                simulation = (
+                    build_automatic_database_simulation(
+                        source=all_items,
+                        invoice_id=invoice_id,
+                        target=float(total_target),
+                        max_price_increase=float(
+                            max_price_increase
+                        ),
+                        max_quantity_increase=float(
+                            max_quantity_increase
+                        ),
+                        new_product_share=float(
+                            new_product_share
+                        ),
+                        max_new_products=int(
+                            max_new_products
+                        ),
+                        rounding_step=int(
+                            rounding_step
+                        ),
+                        tolerance=float(
+                            tolerance
+                        ),
+                    )
+                )
+
+            st.session_state.global_budget_simulation = {
+                "data": simulation[
+                    "dataframe"
+                ].to_dict("records"),
+                "original_total": simulation[
+                    "original_total"
+                ],
+                "revised_total": simulation[
+                    "revised_total"
+                ],
+                "target": simulation["target"],
+                "difference": simulation[
+                    "difference"
+                ],
+                "reached": simulation["reached"],
+                "recommendation_count": simulation[
+                    "recommendation_count"
+                ],
+                "messages": simulation[
+                    "messages"
+                ],
+                "max_price_increase": simulation[
+                    "max_price_increase"
+                ],
+                "max_quantity_increase": simulation[
+                    "max_quantity_increase"
+                ],
+                "new_product_share": simulation[
+                    "new_product_share"
+                ],
+                "rounding_step": simulation[
+                    "rounding_step"
+                ],
+                "tolerance": simulation[
+                    "tolerance"
+                ],
+            }
+
+            st.rerun()
+
+    simulation = st.session_state.get(
+        "global_budget_simulation"
+    )
 
     if simulation:
         st.divider()
-        st.subheader("3. Hasil Simulasi Semua Kategori")
+        st.subheader("3. Hasil Simulasi Otomatis")
 
-        simulation_df = pd.DataFrame(simulation["data"])
+        simulation_df = pd.DataFrame(
+            simulation["data"]
+        )
 
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Total Asli", rupiah(simulation["original_total"]))
-        s2.metric("Total Pagu", rupiah(simulation["target"]))
-        s3.metric("Total Usulan", rupiah(simulation["revised_total"]))
-        s4.metric("Selisih", rupiah(simulation["difference"]))
+        result_1, result_2, result_3, result_4 = (
+            st.columns(4)
+        )
 
-        if simulation["difference"] == 0:
+        result_1.metric(
+            "Total Asli",
+            rupiah(
+                simulation["original_total"]
+            ),
+        )
+
+        result_2.metric(
+            "Target Pagu",
+            rupiah(simulation["target"]),
+        )
+
+        result_3.metric(
+            "Total Usulan",
+            rupiah(
+                simulation["revised_total"]
+            ),
+        )
+
+        result_4.metric(
+            "Selisih",
+            rupiah(
+                abs(simulation["difference"])
+            ),
+        )
+
+        new_product_count = int(
+            (
+                simulation_df["Sumber"]
+                == "Barang Baru Database"
+            ).sum()
+        )
+
+        info_1, info_2, info_3 = st.columns(3)
+
+        info_1.metric(
+            "Barang Baru Ditambahkan",
+            new_product_count,
+        )
+
+        info_2.metric(
+            "Batas Kenaikan Harga",
+            f"{simulation['max_price_increase']:.0f}%",
+        )
+
+        info_3.metric(
+            "Batas Kenaikan Kuantitas",
+            f"{simulation['max_quantity_increase']:.0f}%",
+        )
+
+        if simulation["reached"]:
             st.success(
-                "Hasil sudah tepat sama dengan total pagu target."
+                "Simulasi sudah mencapai target dalam "
+                "batas toleransi."
             )
         else:
-            st.error(
-                f"Selisih masih {rupiah(simulation['difference'])}. "
-                "Hasil belum dapat diterapkan karena harus tepat sama dengan pagu."
+            st.warning(
+                "Simulasi sudah menggunakan barang baru, "
+                "kenaikan kuantitas, dan kenaikan harga "
+                "sesuai batas, tetapi masih memiliki selisih "
+                f"{rupiah(abs(simulation['difference']))}."
             )
 
+        for message in simulation.get(
+            "messages",
+            [],
+        ):
+            st.caption(f"• {message}")
+
         category_summary = (
-            simulation_df.groupby("Kategori", dropna=False)
+            simulation_df.groupby(
+                "Kategori",
+                dropna=False,
+            )
             .agg(
-                Jumlah_Uraian=("Uraian", "count"),
-                Total_Asli=("Jumlah Asli", "sum"),
-                Total_Usulan=("Jumlah Usulan", "sum"),
+                Jumlah_Uraian=(
+                    "Uraian",
+                    "count",
+                ),
+                Total_Asli=(
+                    "Jumlah Asli",
+                    "sum",
+                ),
+                Total_Usulan=(
+                    "Jumlah Usulan",
+                    "sum",
+                ),
+                Barang_Baru=(
+                    "Sumber",
+                    lambda values: int(
+                        (
+                            values
+                            == "Barang Baru Database"
+                        ).sum()
+                    ),
+                ),
             )
             .reset_index()
         )
 
         category_summary["Perubahan"] = (
-            category_summary["Total_Usulan"]
-            - category_summary["Total_Asli"]
+            category_summary[
+                "Total_Usulan"
+            ]
+            - category_summary[
+                "Total_Asli"
+            ]
         )
 
-        st.markdown("#### Ringkasan Per Kategori")
+        st.markdown(
+            "#### Ringkasan Per Kategori"
+        )
 
         st.dataframe(
             category_summary,
             hide_index=True,
             use_container_width=True,
             column_config={
-                "Jumlah_Uraian": "Jumlah Uraian",
-                "Total_Asli": st.column_config.NumberColumn(
-                    "Total Asli",
-                    format="Rp %.0f",
+                "Jumlah_Uraian": (
+                    "Jumlah Uraian"
                 ),
-                "Total_Usulan": st.column_config.NumberColumn(
-                    "Total Usulan",
-                    format="Rp %.0f",
+                "Barang_Baru": (
+                    "Barang Baru"
                 ),
-                "Perubahan": st.column_config.NumberColumn(
-                    "Perubahan",
-                    format="Rp %.0f",
+                "Total_Asli": (
+                    st.column_config.NumberColumn(
+                        "Total Asli",
+                        format="Rp %.0f",
+                    )
+                ),
+                "Total_Usulan": (
+                    st.column_config.NumberColumn(
+                        "Total Usulan",
+                        format="Rp %.0f",
+                    )
+                ),
+                "Perubahan": (
+                    st.column_config.NumberColumn(
+                        "Perubahan",
+                        format="Rp %.0f",
+                    )
                 ),
             },
         )
 
-        st.markdown("#### Detail Semua Barang")
+        st.markdown(
+            "#### Detail Semua Barang"
+        )
 
-        display_columns = [
-            "Kategori",
-            "Nama Nota",
-            "Uraian",
-            "Satuan",
-            "Kuantitas Asli",
-            "Kuantitas Usulan",
-            "Harga Asli",
-            "Harga Usulan",
-            "Jumlah Asli",
-            "Jumlah Usulan",
-            "Kunci",
-        ]
+        for column in DISPLAY_COLUMNS:
+            if column not in simulation_df.columns:
+                simulation_df[column] = None
 
-        selected_result = st.data_editor(
-            simulation_df[display_columns],
+        edited_simulation = st.data_editor(
+            simulation_df[
+                DISPLAY_COLUMNS
+            ],
             hide_index=True,
             use_container_width=True,
-            key="global_simulation_editor",
+            num_rows="dynamic",
+            key="smart_database_simulation_editor",
             column_config={
-                "Kategori": st.column_config.TextColumn(disabled=True),
-                "Nama Nota": st.column_config.TextColumn(disabled=True),
-                "Uraian": st.column_config.TextColumn(
-                    disabled=True,
-                    width="large",
+                "Kategori": (
+                    st.column_config.SelectboxColumn(
+                        "Kategori",
+                        options=CATEGORIES,
+                        required=True,
+                    )
                 ),
-                "Satuan": st.column_config.TextColumn(disabled=True),
-                "Kuantitas Asli": st.column_config.NumberColumn(disabled=True),
-                "Kuantitas Usulan": st.column_config.NumberColumn(
-                    "Kuantitas Usulan",
-                    min_value=0.0,
-                    step=1.0,
-                    disabled=simulation["adjustment_method"] == "Harga saja",
+                "Nama Nota": (
+                    st.column_config.TextColumn(
+                        "Nama Nota",
+                    )
                 ),
-                "Harga Asli": st.column_config.NumberColumn(
-                    disabled=True,
-                    format="Rp %.0f",
+                "Uraian": (
+                    st.column_config.TextColumn(
+                        "Uraian",
+                        width="large",
+                        required=True,
+                    )
                 ),
-                "Harga Usulan": st.column_config.NumberColumn(
-                    "Harga Usulan",
-                    min_value=0.0,
-                    step=float(simulation["rounding_step"]),
-                    format="Rp %.0f",
-                    disabled=simulation["adjustment_method"] == "Kuantitas saja",
+                "Satuan": (
+                    st.column_config.SelectboxColumn(
+                        "Satuan",
+                        options=UNITS,
+                        required=True,
+                    )
                 ),
-                "Jumlah Asli": st.column_config.NumberColumn(
-                    disabled=True,
-                    format="Rp %.0f",
+                "Kuantitas Asli": (
+                    st.column_config.NumberColumn(
+                        "Kuantitas Asli",
+                        disabled=True,
+                    )
                 ),
-                "Jumlah Usulan": st.column_config.NumberColumn(
-                    disabled=True,
-                    format="Rp %.0f",
+                "Kuantitas Usulan": (
+                    st.column_config.NumberColumn(
+                        "Kuantitas Usulan",
+                        min_value=0.0,
+                        step=1.0,
+                    )
                 ),
-                "Kunci": st.column_config.CheckboxColumn(disabled=True),
+                "Harga Asli": (
+                    st.column_config.NumberColumn(
+                        "Harga Asli",
+                        format="Rp %.0f",
+                        disabled=True,
+                    )
+                ),
+                "Harga Usulan": (
+                    st.column_config.NumberColumn(
+                        "Harga Usulan",
+                        min_value=0.0,
+                        step=float(
+                            simulation[
+                                "rounding_step"
+                            ]
+                        ),
+                        format="Rp %.0f",
+                    )
+                ),
+                "Jumlah Asli": (
+                    st.column_config.NumberColumn(
+                        "Jumlah Asli",
+                        format="Rp %.0f",
+                        disabled=True,
+                    )
+                ),
+                "Jumlah Usulan": (
+                    st.column_config.NumberColumn(
+                        "Jumlah Usulan",
+                        format="Rp %.0f",
+                        disabled=True,
+                    )
+                ),
+                "Sumber": (
+                    st.column_config.TextColumn(
+                        "Sumber",
+                        disabled=True,
+                    )
+                ),
+                "Kunci": (
+                    st.column_config.CheckboxColumn(
+                        "Kunci",
+                    )
+                ),
             },
         )
 
-        preview_qty = pd.to_numeric(
-            selected_result["Kuantitas Usulan"],
+        edited_simulation[
+            "Kuantitas Usulan"
+        ] = pd.to_numeric(
+            edited_simulation[
+                "Kuantitas Usulan"
+            ],
             errors="coerce",
         ).fillna(0.0)
 
-        preview_price = pd.to_numeric(
-            selected_result["Harga Usulan"],
+        edited_simulation[
+            "Harga Usulan"
+        ] = pd.to_numeric(
+            edited_simulation[
+                "Harga Usulan"
+            ],
             errors="coerce",
         ).fillna(0.0)
 
-        preview_total = float((preview_qty * preview_price).sum())
-        preview_difference = abs(float(simulation["target"]) - preview_total)
-        preview_valid = preview_difference == 0
+        edited_simulation[
+            "Jumlah Usulan"
+        ] = (
+            edited_simulation[
+                "Kuantitas Usulan"
+            ]
+            * edited_simulation[
+                "Harga Usulan"
+            ]
+        )
 
-        p1, p2 = st.columns(2)
-        p1.metric("Total Setelah Koreksi", rupiah(preview_total))
-        p2.metric("Selisih dari Total Pagu", rupiah(preview_difference))
+        preview_total = float(
+            edited_simulation[
+                "Jumlah Usulan"
+            ].sum()
+        )
+
+        preview_difference = (
+            float(simulation["target"])
+            - preview_total
+        )
+
+        preview_valid = (
+            abs(preview_difference)
+            <= float(
+                simulation["tolerance"]
+            )
+        )
+
+        preview_1, preview_2 = st.columns(2)
+
+        preview_1.metric(
+            "Total Setelah Koreksi Manual",
+            rupiah(preview_total),
+        )
+
+        preview_2.metric(
+            "Selisih dari Target",
+            rupiah(
+                abs(preview_difference)
+            ),
+        )
 
         if preview_valid:
             st.success(
-                "Hasil tepat sama dengan total pagu dan dapat diterapkan."
+                "Hasil dapat diterapkan."
             )
         else:
-            st.error(
-                "Hasil belum dapat diterapkan. Total Usulan harus tepat sama "
-                "dengan Total Pagu."
+            st.warning(
+                "Hasil masih di luar toleransi. "
+                "Kamu tetap dapat mengubah kuantitas "
+                "atau harga usulan."
             )
 
         apply_col, clear_col = st.columns(2)
 
         if apply_col.button(
-            "✅ Terapkan ke Semua Kategori",
+            "✅ Terapkan Simulasi",
             type="primary",
             use_container_width=True,
             disabled=not preview_valid,
-            key="apply_global_simulation",
         ):
-            updated = simulation_df.copy()
+            updated = edited_simulation.copy()
 
-            for idx in updated.index:
-                proposed_qty = float(
-                    selected_result.at[idx, "Kuantitas Usulan"]
-                )
-                proposed_price = float(
-                    selected_result.at[idx, "Harga Usulan"]
-                )
+            updated["Kuantitas"] = updated[
+                "Kuantitas Usulan"
+            ]
 
-                updated.at[idx, "Kuantitas"] = proposed_qty
-                updated.at[idx, "Harga"] = proposed_price
-                updated.at[idx, "Jumlah"] = proposed_qty * proposed_price
+            updated["Harga"] = updated[
+                "Harga Usulan"
+            ]
+
+            updated["Jumlah"] = updated[
+                "Jumlah Usulan"
+            ]
 
             keep_columns = [
                 "Uraian",
@@ -918,68 +1506,71 @@ if revision_mode == "🚀 Otomatis — Simulasikan Semua Kategori":
                 "Kunci",
             ]
 
-            updated = prepare_dataframe(updated[keep_columns])
-
-            final_difference = abs(
-                float(simulation["target"])
-                - float(updated["Jumlah"].sum())
+            updated = prepare_dataframe(
+                updated[keep_columns]
             )
 
-            if final_difference != 0:
-                st.error(
-                    "Data tidak diterapkan karena total akhir belum "
-                    "tepat sama dengan total pagu."
-                )
-                st.stop()
+            st.session_state.invoice_items = (
+                updated.to_dict("records")
+            )
 
-            st.session_state.invoice_items = updated.to_dict("records")
-            st.session_state.global_budget_simulation = None
+            st.session_state.final_items = (
+                st.session_state.invoice_items
+            )
 
-            st.success("Hasil berhasil diterapkan ke semua kategori.")
+            st.session_state.matched_items = (
+                st.session_state.invoice_items
+            )
+
+            st.session_state.global_budget_simulation = (
+                None
+            )
+
+            st.success(
+                "Barang baru, perubahan kuantitas, "
+                "dan perubahan harga berhasil diterapkan."
+            )
+
             st.rerun()
 
         if clear_col.button(
             "🗑️ Hapus Simulasi",
             use_container_width=True,
-            key="clear_global_simulation",
         ):
-            st.session_state.global_budget_simulation = None
+            st.session_state.global_budget_simulation = (
+                None
+            )
             st.rerun()
 
 
 # =========================================================
-# MODE MANUAL PER KATEGORI
+# MODE MANUAL
 # =========================================================
 
 else:
     st.info(
-        "Pilih kategori yang ingin direvisi. Simulasi dan perubahan hanya "
-        "berlaku untuk kategori tersebut."
+        "Pilih kategori yang ingin direvisi secara manual."
     )
 
     available_categories = sorted(
-        all_items["Kategori"].astype(str).unique().tolist()
+        all_items[
+            "Kategori"
+        ].astype(str).unique().tolist()
     )
 
     selected_category = st.selectbox(
         "Pilih kategori",
         available_categories,
-        key="manual_selected_category",
     )
 
     category_items = (
         all_items[
-            all_items["Kategori"] == selected_category
+            all_items["Kategori"]
+            == selected_category
         ]
         .copy()
         .reset_index(drop=True)
     )
-
-    if category_items.empty:
-        st.info("Kategori ini belum memiliki barang.")
-        st.stop()
-
-    st.subheader("Revisi Data Manual")
 
     edited_category = st.data_editor(
         category_items,
@@ -988,81 +1579,140 @@ else:
         use_container_width=True,
         key=f"manual_editor_{selected_category}",
         column_config={
-            "Uraian": st.column_config.TextColumn(
-                "Uraian Barang",
-                required=True,
-                width="large",
+            "Uraian": (
+                st.column_config.TextColumn(
+                    "Uraian Barang",
+                    required=True,
+                    width="large",
+                )
             ),
-            "Kuantitas": st.column_config.NumberColumn(
-                "Kuantitas",
-                min_value=0.0,
-                step=1.0,
+            "Kuantitas": (
+                st.column_config.NumberColumn(
+                    "Kuantitas",
+                    min_value=0.0,
+                    step=1.0,
+                )
             ),
-            "Satuan": st.column_config.SelectboxColumn(
-                "Satuan",
-                options=UNITS,
+            "Satuan": (
+                st.column_config.SelectboxColumn(
+                    "Satuan",
+                    options=UNITS,
+                )
             ),
-            "Harga": st.column_config.NumberColumn(
-                "Harga Satuan",
-                min_value=0.0,
-                step=1000.0,
-                format="Rp %.0f",
+            "Harga": (
+                st.column_config.NumberColumn(
+                    "Harga Satuan",
+                    min_value=0.0,
+                    step=1000.0,
+                    format="Rp %.0f",
+                )
             ),
-            "Jumlah": st.column_config.NumberColumn(
-                "Jumlah",
-                disabled=True,
-                format="Rp %.0f",
+            "Jumlah": (
+                st.column_config.NumberColumn(
+                    "Jumlah",
+                    disabled=True,
+                    format="Rp %.0f",
+                )
             ),
-            "Kategori": st.column_config.SelectboxColumn(
-                "Kategori",
-                options=CATEGORIES,
+            "Kategori": (
+                st.column_config.SelectboxColumn(
+                    "Kategori",
+                    options=CATEGORIES,
+                )
             ),
-            "Nama Nota": st.column_config.TextColumn("Nama Nota"),
-            "Kunci": st.column_config.CheckboxColumn(
-                "Kunci",
-                help="Item ini tidak diubah oleh simulasi otomatis.",
+            "Nama Nota": (
+                st.column_config.TextColumn(
+                    "Nama Nota",
+                )
+            ),
+            "Kunci": (
+                st.column_config.CheckboxColumn(
+                    "Kunci",
+                )
             ),
         },
     )
 
-    edited_category = recalculate(edited_category)
+    edited_category = recalculate(
+        edited_category
+    )
 
     edited_category = edited_category[
-        edited_category["Uraian"]
+        edited_category[
+            "Uraian"
+        ]
         .fillna("")
         .astype(str)
         .str.strip()
-        != ""
+        .ne("")
     ].copy()
 
-    category_total = float(edited_category["Jumlah"].sum())
+    category_total = float(
+        edited_category[
+            "Jumlah"
+        ].sum()
+    )
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Jumlah Uraian", len(edited_category))
-    m2.metric(f"Total {selected_category}", rupiah(category_total))
-    m3.metric("Item Terkunci", int(edited_category["Kunci"].sum()))
+    manual_1, manual_2, manual_3 = st.columns(3)
+
+    manual_1.metric(
+        "Jumlah Uraian",
+        len(edited_category),
+    )
+
+    manual_2.metric(
+        f"Total {selected_category}",
+        rupiah(category_total),
+    )
+
+    manual_3.metric(
+        "Item Terkunci",
+        int(
+            edited_category[
+                "Kunci"
+            ].sum()
+        ),
+    )
 
     if st.button(
         f"💾 Simpan Revisi Manual {selected_category}",
         use_container_width=True,
-        key="save_manual_revision",
     ):
         others = all_items[
-            all_items["Kategori"] != selected_category
+            all_items["Kategori"]
+            != selected_category
         ].copy()
 
         combined = prepare_dataframe(
             pd.concat(
-                [others, edited_category],
+                [
+                    others,
+                    edited_category,
+                ],
                 ignore_index=True,
             )
         )
 
-        st.session_state.invoice_items = combined.to_dict("records")
-        st.session_state.budget_simulation = None
-        st.session_state.global_budget_simulation = None
+        st.session_state.invoice_items = (
+            combined.to_dict("records")
+        )
 
-        st.success("Revisi manual berhasil disimpan.")
+        st.session_state.final_items = (
+            st.session_state.invoice_items
+        )
+
+        st.session_state.matched_items = (
+            st.session_state.invoice_items
+        )
+
+        st.session_state.global_budget_simulation = (
+            None
+        )
+
+        st.success(
+            "Revisi manual berhasil disimpan."
+        )
+
         st.rerun()
 
 
@@ -1073,13 +1723,24 @@ else:
 st.divider()
 st.subheader("Ringkasan Akhir Tersimpan")
 
-latest = prepare_dataframe(st.session_state.invoice_items)
+latest = prepare_dataframe(
+    st.session_state.invoice_items
+)
 
 summary = (
-    latest.groupby("Kategori", dropna=False)
+    latest.groupby(
+        "Kategori",
+        dropna=False,
+    )
     .agg(
-        Jumlah_Uraian=("Uraian", "count"),
-        Total=("Jumlah", "sum"),
+        Jumlah_Uraian=(
+            "Uraian",
+            "count",
+        ),
+        Total=(
+            "Jumlah",
+            "sum",
+        ),
     )
     .reset_index()
 )
@@ -1089,17 +1750,25 @@ st.dataframe(
     hide_index=True,
     use_container_width=True,
     column_config={
-        "Jumlah_Uraian": "Jumlah Uraian",
-        "Total": st.column_config.NumberColumn(
-            "Total",
-            format="Rp %.0f",
+        "Jumlah_Uraian": (
+            "Jumlah Uraian"
+        ),
+        "Total": (
+            st.column_config.NumberColumn(
+                "Total",
+                format="Rp %.0f",
+            )
         ),
     },
 )
 
 st.metric(
     "Total Seluruh Kategori",
-    rupiah(latest["Jumlah"].sum()),
+    rupiah(
+        latest["Jumlah"].sum()
+    ),
 )
 
-st.info("Setelah selesai, buka halaman Download.")
+st.info(
+    "Setelah selesai, buka halaman Download."
+)

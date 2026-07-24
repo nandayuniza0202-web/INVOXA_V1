@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,9 @@ import pandas as pd
 import pytesseract
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+from services.category_service import apply_predicted_categories
+from services.import_service import import_tabular_file, save_imported_invoice
 
 
 # =========================================================
@@ -29,7 +33,6 @@ st.set_page_config(
 
 CATEGORIES = [
     "Belum Dikategorikan",
-    "ATK",
     "APD",
     "Alat Kebersihan",
     "Alat Kelengkapan",
@@ -56,6 +59,8 @@ UNITS = [
     "cm",
     "lembar",
     "pasang",
+    "bungkus",
+    "bal",
 ]
 
 COLUMNS = [
@@ -88,7 +93,6 @@ def numeric_value(value: Any) -> float:
         return float(value)
 
     text = str(value).strip()
-
     if not text:
         return 0.0
 
@@ -100,21 +104,18 @@ def numeric_value(value: Any) -> float:
         .replace(" ", "")
     )
 
-    # Jika ada titik dan koma, tentukan pemisah desimal dari posisi terakhir.
     if "." in text and "," in text:
         if text.rfind(",") > text.rfind("."):
             text = text.replace(".", "").replace(",", ".")
         else:
             text = text.replace(",", "")
     elif "," in text:
-        # Format Indonesia: 10.000,50 atau 10000,50
         parts = text.split(",")
         if len(parts[-1]) in (1, 2):
             text = text.replace(".", "").replace(",", ".")
         else:
             text = text.replace(",", "")
     elif "." in text:
-        # Titik biasanya pemisah ribuan.
         parts = text.split(".")
         if len(parts) > 1 and all(len(part) == 3 for part in parts[1:]):
             text = text.replace(".", "")
@@ -128,14 +129,12 @@ def numeric_value(value: Any) -> float:
 
 
 def rupiah(value: Any) -> str:
-    number = numeric_value(value)
-    return f"Rp{number:,.0f}".replace(",", ".")
+    return f"Rp{numeric_value(value):,.0f}".replace(",", ".")
 
 
 def empty_dataframe(rows: int = 1) -> pd.DataFrame:
-    data = []
-    for _ in range(max(rows, 0)):
-        data.append(
+    return pd.DataFrame(
+        [
             {
                 "Uraian": "",
                 "Kuantitas": 1.0,
@@ -146,22 +145,21 @@ def empty_dataframe(rows: int = 1) -> pd.DataFrame:
                 "Nama Nota": "",
                 "Kunci": False,
             }
-        )
-    return pd.DataFrame(data, columns=COLUMNS)
+            for _ in range(max(rows, 0))
+        ],
+        columns=COLUMNS,
+    )
 
 
 def prepare_dataframe(data: Any) -> pd.DataFrame:
-    """Menormalkan data agar selalu mempunyai kolom yang dibutuhkan."""
+    """Menormalkan data agar selalu mempunyai kolom INVOXA."""
     if data is None:
         return empty_dataframe()
 
-    if isinstance(data, pd.DataFrame):
-        df = data.copy()
-    else:
-        try:
-            df = pd.DataFrame(data)
-        except Exception:
-            df = empty_dataframe()
+    try:
+        df = data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    except Exception:
+        return empty_dataframe()
 
     defaults = {
         "Uraian": "",
@@ -179,26 +177,23 @@ def prepare_dataframe(data: Any) -> pd.DataFrame:
             df[column] = default
 
     df = df[COLUMNS].copy()
-
-    df["Uraian"] = df["Uraian"].fillna("").astype(str)
-    df["Satuan"] = df["Satuan"].fillna("pcs").astype(str)
+    df["Uraian"] = df["Uraian"].fillna("").astype(str).str.strip()
+    df["Satuan"] = df["Satuan"].fillna("pcs").astype(str).str.lower().str.strip()
     df["Kategori"] = (
         df["Kategori"]
         .fillna("Belum Dikategorikan")
         .astype(str)
+        .str.strip()
     )
-    df["Nama Nota"] = df["Nama Nota"].fillna("").astype(str)
+    df["Nama Nota"] = df["Nama Nota"].fillna("").astype(str).str.strip()
     df["Kunci"] = df["Kunci"].fillna(False).astype(bool)
 
-    df["Kuantitas"] = df["Kuantitas"].apply(numeric_value)
-    df["Harga"] = df["Harga"].apply(numeric_value)
-    df["Jumlah"] = df["Jumlah"].apply(numeric_value)
+    for column in ["Kuantitas", "Harga", "Jumlah"]:
+        df[column] = df[column].apply(numeric_value)
 
     df.loc[df["Kuantitas"] <= 0, "Kuantitas"] = 1.0
     df.loc[~df["Satuan"].isin(UNITS), "Satuan"] = "pcs"
-    df.loc[~df["Kategori"].isin(CATEGORIES), "Kategori"] = (
-        "Belum Dikategorikan"
-    )
+    df.loc[~df["Kategori"].isin(CATEGORIES), "Kategori"] = "Belum Dikategorikan"
 
     return df.reset_index(drop=True)
 
@@ -206,14 +201,7 @@ def prepare_dataframe(data: Any) -> pd.DataFrame:
 def dataframe_changed(old: pd.DataFrame, new: pd.DataFrame) -> bool:
     old_norm = prepare_dataframe(old)
     new_norm = prepare_dataframe(new)
-
-    if old_norm.shape != new_norm.shape:
-        return True
-
-    try:
-        return not old_norm.equals(new_norm)
-    except Exception:
-        return True
+    return old_norm.shape != new_norm.shape or not old_norm.equals(new_norm)
 
 
 def changed_number(old: Any, new: Any, tolerance: float = 0.01) -> bool:
@@ -224,72 +212,47 @@ def synchronize_dataframe(
     previous: pd.DataFrame,
     edited: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Sinkronisasi dua arah:
-    - Kuantitas + Harga => Jumlah
-    - Kuantitas + Jumlah => Harga
-    - Jika Harga diubah, Jumlah menjadi prioritas hasil perhitungan.
-    - Jika Jumlah diubah, Harga menjadi prioritas hasil perhitungan.
-    - Jika Kuantitas diubah, Jumlah dihitung dari Harga bila Harga tersedia.
-    """
+    """Sinkronisasi Kuantitas, Harga, dan Jumlah dua arah."""
     old_df = prepare_dataframe(previous)
     new_df = prepare_dataframe(edited)
 
     for index in new_df.index:
-        qty = numeric_value(new_df.at[index, "Kuantitas"])
+        qty = max(numeric_value(new_df.at[index, "Kuantitas"]), 1.0)
         price = numeric_value(new_df.at[index, "Harga"])
         total = numeric_value(new_df.at[index, "Jumlah"])
-
-        if qty <= 0:
-            qty = 1.0
-            new_df.at[index, "Kuantitas"] = qty
+        new_df.at[index, "Kuantitas"] = qty
 
         if index < len(old_df):
-            old_qty = numeric_value(old_df.at[index, "Kuantitas"])
-            old_price = numeric_value(old_df.at[index, "Harga"])
-            old_total = numeric_value(old_df.at[index, "Jumlah"])
-
-            qty_changed = changed_number(old_qty, qty)
-            price_changed = changed_number(old_price, price)
-            total_changed = changed_number(old_total, total)
+            qty_changed = changed_number(old_df.at[index, "Kuantitas"], qty)
+            price_changed = changed_number(old_df.at[index, "Harga"], price)
+            total_changed = changed_number(old_df.at[index, "Jumlah"], total)
         else:
             qty_changed = True
             price_changed = price > 0
             total_changed = total > 0
 
-        # Harga diubah: hitung Jumlah.
         if price_changed and not total_changed:
             new_df.at[index, "Jumlah"] = qty * price
-
-        # Jumlah diubah: hitung Harga.
         elif total_changed and not price_changed:
-            new_df.at[index, "Harga"] = total / qty if qty > 0 else 0.0
-
-        # Keduanya berubah: prioritaskan Jumlah yang diketik pengguna.
+            new_df.at[index, "Harga"] = total / qty
         elif price_changed and total_changed:
-            if total > 0 and qty > 0:
+            if total > 0:
                 new_df.at[index, "Harga"] = total / qty
             elif price > 0:
                 new_df.at[index, "Jumlah"] = qty * price
-
-        # Hanya kuantitas berubah.
         elif qty_changed:
             if price > 0:
                 new_df.at[index, "Jumlah"] = qty * price
-            elif total > 0 and qty > 0:
+            elif total > 0:
                 new_df.at[index, "Harga"] = total / qty
-
-        # Lengkapi data awal hasil OCR/Excel.
         else:
-            if price <= 0 and total > 0 and qty > 0:
+            if price <= 0 and total > 0:
                 new_df.at[index, "Harga"] = total / qty
             elif total <= 0 and price > 0:
                 new_df.at[index, "Jumlah"] = qty * price
 
     new_df["Harga"] = new_df["Harga"].apply(numeric_value).round(0)
     new_df["Jumlah"] = new_df["Jumlah"].apply(numeric_value).round(0)
-    new_df["Kuantitas"] = new_df["Kuantitas"].apply(numeric_value)
-
     return prepare_dataframe(new_df)
 
 
@@ -297,7 +260,6 @@ def append_rows(rows: pd.DataFrame) -> None:
     rows = prepare_dataframe(rows)
     current = prepare_dataframe(st.session_state.input_table)
 
-    # Hapus baris kosong bawaan bila belum pernah diisi.
     if (
         len(current) == 1
         and not current.at[0, "Uraian"].strip()
@@ -306,8 +268,9 @@ def append_rows(rows: pd.DataFrame) -> None:
     ):
         current = current.iloc[0:0]
 
-    combined = pd.concat([current, rows], ignore_index=True)
-    st.session_state.input_table = prepare_dataframe(combined)
+    st.session_state.input_table = prepare_dataframe(
+        pd.concat([current, rows], ignore_index=True)
+    )
     st.session_state.input_editor_version += 1
 
 
@@ -316,129 +279,54 @@ def replace_rows(rows: pd.DataFrame) -> None:
     st.session_state.input_editor_version += 1
 
 
-# =========================================================
-# EXCEL
-# =========================================================
-
-def normalize_column_name(name: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(name).lower())
-
-
-def find_matching_column(
-    columns: list[str],
-    candidates: list[str],
-) -> str | None:
-    normalized = {normalize_column_name(column): column for column in columns}
-
-    for candidate in candidates:
-        key = normalize_column_name(candidate)
-        if key in normalized:
-            return normalized[key]
-
-    for normalized_name, original_name in normalized.items():
-        for candidate in candidates:
-            key = normalize_column_name(candidate)
-            if key and key in normalized_name:
-                return original_name
-
-    return None
-
-
-def map_excel_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
-    if raw_df is None or raw_df.empty:
+def service_dataframe_to_ui(dataframe: pd.DataFrame, note_name: str = "") -> pd.DataFrame:
+    """Mengubah hasil parser universal ke bentuk tabel halaman Input Nota."""
+    if dataframe is None or dataframe.empty:
         return empty_dataframe(0)
 
-    raw_df = raw_df.dropna(how="all").copy()
-    columns = list(raw_df.columns)
-
-    mapping_candidates = {
-        "Uraian": [
-            "uraian",
-            "nama barang",
-            "barang",
-            "deskripsi",
-            "item",
-            "produk",
-            "keterangan",
-        ],
-        "Kuantitas": [
-            "kuantitas",
-            "qty",
-            "jumlah barang",
-            "volume",
-            "banyak",
-        ],
-        "Satuan": ["satuan", "unit"],
-        "Harga": [
-            "harga satuan",
-            "harga",
-            "unit price",
-            "harga unit",
-        ],
-        "Jumlah": [
-            "jumlah",
-            "total",
-            "subtotal",
-            "nilai",
-            "pengeluaran",
-        ],
-        "Kategori": ["kategori", "jenis"],
-        "Nama Nota": [
-            "nama nota",
-            "nota",
-            "invoice",
-            "no nota",
-            "nomor nota",
-        ],
-    }
-
-    result = empty_dataframe(0)
-
-    for target, candidates in mapping_candidates.items():
-        source = find_matching_column(columns, candidates)
-        if source:
-            result[target] = raw_df[source]
-
-    if "Uraian" not in result.columns or result["Uraian"].empty:
-        # Gunakan kolom teks pertama sebagai uraian.
-        text_columns = [
-            column
-            for column in columns
-            if raw_df[column].dtype == "object"
-        ]
-        if text_columns:
-            result["Uraian"] = raw_df[text_columns[0]]
-        else:
-            result["Uraian"] = ""
-
-    result = prepare_dataframe(result)
-
-    # Lengkapi Harga/Jumlah.
-    for index in result.index:
-        qty = numeric_value(result.at[index, "Kuantitas"])
-        price = numeric_value(result.at[index, "Harga"])
-        total = numeric_value(result.at[index, "Jumlah"])
-
-        if qty <= 0:
-            qty = 1
-            result.at[index, "Kuantitas"] = qty
-
-        if price <= 0 and total > 0:
-            result.at[index, "Harga"] = total / qty
-        elif total <= 0 and price > 0:
-            result.at[index, "Jumlah"] = qty * price
-
-    # Buang baris yang benar-benar kosong.
-    mask = (
-        result["Uraian"].str.strip().ne("")
-        | result["Harga"].gt(0)
-        | result["Jumlah"].gt(0)
+    source = dataframe.copy()
+    result = pd.DataFrame(
+        {
+            "Uraian": source.get("raw_description", ""),
+            "Kuantitas": source.get("quantity", 1),
+            "Satuan": source.get("unit", "pcs"),
+            "Harga": source.get("unit_price", 0),
+            "Jumlah": source.get("total_price", 0),
+            "Kategori": source.get("category", "Belum Dikategorikan"),
+            "Nama Nota": note_name,
+            "Kunci": False,
+        }
     )
-    return prepare_dataframe(result.loc[mask].reset_index(drop=True))
+
+    if "source_filename" in source.columns:
+        source_names = source["source_filename"].fillna("").astype(str)
+        result["Nama Nota"] = source_names.apply(
+            lambda value: Path(value).stem if value else note_name
+        )
+
+    return prepare_dataframe(result)
+
+
+def ui_dataframe_to_service(dataframe: pd.DataFrame, input_method: str) -> pd.DataFrame:
+    """Mengubah tabel editor ke format yang disimpan oleh import_service."""
+    df = prepare_dataframe(dataframe)
+    result = pd.DataFrame(
+        {
+            "raw_description": df["Uraian"],
+            "quantity": df["Kuantitas"],
+            "unit": df["Satuan"],
+            "unit_price": df["Harga"],
+            "total_price": df["Jumlah"],
+            "category": df["Kategori"],
+            "source_filename": df["Nama Nota"],
+            "input_method": input_method,
+        }
+    )
+    return result
 
 
 # =========================================================
-# OCR FOTO
+# OCR FOTO DAN PDF
 # =========================================================
 
 def file_hash(file_bytes: bytes) -> str:
@@ -446,8 +334,7 @@ def file_hash(file_bytes: bytes) -> str:
 
 
 def preprocess_image(image: Image.Image) -> Image.Image:
-    image = ImageOps.exif_transpose(image)
-    image = image.convert("L")
+    image = ImageOps.exif_transpose(image).convert("L")
     image = ImageOps.autocontrast(image)
     image = ImageEnhance.Contrast(image).enhance(1.8)
     image = image.filter(ImageFilter.SHARPEN)
@@ -455,23 +342,15 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     width, height = image.size
     if width < 1600:
         ratio = 1600 / max(width, 1)
-        image = image.resize(
-            (int(width * ratio), int(height * ratio))
-        )
+        image = image.resize((int(width * ratio), int(height * ratio)))
 
     return image
 
 
 def clean_ocr_text(text: str) -> str:
-    replacements = {
-        "O": "0",
-        "o": "0",
-        "I": "1",
-        "l": "1",
-    }
-
-    # Penggantian hanya pada token yang sebagian besar berupa angka.
+    replacements = {"O": "0", "o": "0", "I": "1", "l": "1"}
     tokens = []
+
     for token in text.split():
         digit_count = sum(character.isdigit() for character in token)
         if digit_count >= max(1, len(token) // 2):
@@ -489,38 +368,33 @@ def extract_money_values(line: str) -> list[float]:
         line,
         flags=re.IGNORECASE,
     )
-
-    values = []
-    for pattern in patterns:
-        value = numeric_value(pattern)
-        if value > 0:
-            values.append(value)
-
-    return values
+    return [numeric_value(value) for value in patterns if numeric_value(value) > 0]
 
 
 def detect_quantity_and_unit(line: str) -> tuple[float, str]:
     unit_pattern = "|".join(re.escape(unit) for unit in UNITS)
 
-    patterns = [
+    first = re.search(
         rf"\b(\d+(?:[.,]\d+)?)\s*({unit_pattern})\b",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if first:
+        return numeric_value(first.group(1)), first.group(2).lower()
+
+    second = re.search(
         rf"\b({unit_pattern})\s*(\d+(?:[.,]\d+)?)\b",
-    ]
+        line,
+        flags=re.IGNORECASE,
+    )
+    if second:
+        return numeric_value(second.group(2)), second.group(1).lower()
 
-    match = re.search(patterns[0], line, flags=re.IGNORECASE)
-    if match:
-        return numeric_value(match.group(1)), match.group(2).lower()
-
-    match = re.search(patterns[1], line, flags=re.IGNORECASE)
-    if match:
-        return numeric_value(match.group(2)), match.group(1).lower()
-
-    # Angka kecil di awal baris sering merupakan qty.
-    match = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s+", line)
-    if match:
-        qty = numeric_value(match.group(1))
-        if 0 < qty <= 10000:
-            return qty, "pcs"
+    beginning = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s+", line)
+    if beginning:
+        quantity = numeric_value(beginning.group(1))
+        if 0 < quantity <= 10000:
+            return quantity, "pcs"
 
     return 1.0, "pcs"
 
@@ -530,28 +404,21 @@ def remove_price_and_quantity_from_description(
     quantity: float,
     unit: str,
 ) -> str:
-    description = line
-
     description = re.sub(
         r"(?:Rp\s*)?\d{1,3}(?:[.\s]\d{3})+(?:,\d{1,2})?"
         r"|(?:Rp\s*)?\d{4,}(?:,\d{1,2})?",
         " ",
-        description,
+        line,
         flags=re.IGNORECASE,
     )
 
-    if quantity > 0:
-        quantity_strings = {
-            str(int(quantity)) if quantity.is_integer() else str(quantity),
-            str(quantity).replace(".", ","),
-        }
-        for quantity_string in quantity_strings:
-            description = re.sub(
-                rf"^\s*{re.escape(quantity_string)}\s*",
-                " ",
-                description,
-                count=1,
-            )
+    quantity_text = str(int(quantity)) if float(quantity).is_integer() else str(quantity)
+    description = re.sub(
+        rf"^\s*{re.escape(quantity_text)}\s*",
+        " ",
+        description,
+        count=1,
+    )
 
     if unit:
         description = re.sub(
@@ -561,13 +428,11 @@ def remove_price_and_quantity_from_description(
             flags=re.IGNORECASE,
         )
 
-    description = re.sub(r"\s+", " ", description).strip(" -:|")
-    return description
+    return re.sub(r"\s+", " ", description).strip(" -:|")
 
 
 def should_skip_ocr_line(line: str) -> bool:
     normalized = line.lower().strip()
-
     if len(normalized) < 3:
         return True
 
@@ -587,62 +452,42 @@ def should_skip_ocr_line(line: str) -> bool:
         "tanggal",
         "no bukti",
         "saldo",
-        "pemasukan",
-        "pengeluaran",
         "debit",
         "kredit",
     ]
-
     return any(word in normalized for word in skip_words)
 
 
-def parse_ocr_text(
-    text: str,
-    category: str,
-    note_name: str,
-) -> pd.DataFrame:
+def parse_ocr_text(text: str, note_name: str) -> pd.DataFrame:
     rows = []
 
     for raw_line in text.splitlines():
         line = clean_ocr_text(raw_line).strip()
-
         if should_skip_ocr_line(line):
             continue
 
         money_values = extract_money_values(line)
-
-        # Baris tanpa nilai uang biasanya bukan baris item.
         if not money_values:
             continue
 
         quantity, unit = detect_quantity_and_unit(line)
-
-        if quantity <= 0:
-            quantity = 1.0
+        quantity = max(quantity, 1.0)
 
         if len(money_values) >= 2:
             price = money_values[-2]
             total = money_values[-1]
-
-            # Koreksi jika angka terakhir tampaknya bukan hasil qty x harga.
             expected = quantity * price
-            if quantity > 0 and expected > 0:
-                difference_ratio = abs(total - expected) / expected
-                if difference_ratio > 0.25:
-                    # Prioritaskan angka terakhir sebagai jumlah.
-                    price = total / quantity
+            if expected > 0 and abs(total - expected) / expected > 0.25:
+                price = total / quantity
         else:
             total = money_values[-1]
-            price = total / quantity if quantity > 0 else total
+            price = total / quantity
 
         description = remove_price_and_quantity_from_description(
             line,
             float(quantity),
             unit,
-        )
-
-        if not description:
-            description = "Perlu dikoreksi"
+        ) or "Perlu dikoreksi"
 
         rows.append(
             {
@@ -651,71 +496,88 @@ def parse_ocr_text(
                 "Satuan": unit if unit in UNITS else "pcs",
                 "Harga": price,
                 "Jumlah": total,
-                "Kategori": category,
+                "Kategori": "Belum Dikategorikan",
                 "Nama Nota": note_name,
                 "Kunci": False,
             }
         )
 
-    return prepare_dataframe(rows) if rows else empty_dataframe(0)
+    if not rows:
+        return empty_dataframe(0)
+
+    ui_df = prepare_dataframe(rows)
+    predicted = apply_predicted_categories(
+        ui_dataframe_to_service(ui_df, "ocr")
+    )
+    return service_dataframe_to_ui(predicted, note_name=note_name)
 
 
 def run_ocr(image: Image.Image) -> str:
     processed = preprocess_image(image)
-
-    configurations = [
-        "--oem 3 --psm 6",
-        "--oem 3 --psm 4",
-    ]
-
     outputs = []
-    for config in configurations:
+
+    for config in ["--oem 3 --psm 6", "--oem 3 --psm 4"]:
         try:
-            text = pytesseract.image_to_string(
-                processed,
-                lang="eng",
-                config=config,
+            outputs.append(
+                pytesseract.image_to_string(
+                    processed,
+                    lang="eng",
+                    config=config,
+                )
             )
-            outputs.append(text)
         except pytesseract.TesseractNotFoundError:
             raise
         except Exception:
             continue
 
-    if not outputs:
-        return ""
+    return max(outputs, key=lambda value: len(value.strip())) if outputs else ""
 
-    # Pilih hasil yang memiliki paling banyak karakter bermakna.
-    return max(outputs, key=lambda value: len(value.strip()))
+
+def pdf_pages_to_images(file_bytes: bytes) -> list[Image.Image]:
+    """Mengubah PDF menjadi gambar. Memerlukan PyMuPDF."""
+    try:
+        import fitz  # type: ignore
+    except ImportError as error:
+        raise RuntimeError(
+            "Pembaca PDF belum terpasang. Jalankan: pip install pymupdf"
+        ) from error
+
+    document = fitz.open(stream=file_bytes, filetype="pdf")
+    images: list[Image.Image] = []
+
+    for page in document:
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+        images.append(image)
+
+    document.close()
+    return images
 
 
 # =========================================================
 # SESSION STATE
 # =========================================================
 
-if "invoice_items" not in st.session_state:
-    st.session_state.invoice_items = []
+SESSION_DEFAULTS = {
+    "invoice_items": [],
+    "input_table": empty_dataframe(),
+    "customer_name": "",
+    "customer_address": "",
+    "invoice_period": "",
+    "invoice_number": "",
+    "vendor_name": "",
+    "selected_template": "",
+    "ocr_cache": {},
+    "input_editor_version": 0,
+    "last_input_method": "manual",
+    "current_invoice_id": None,
+    "invoice_id": None,
+    "saved_invoice_id": None,
+}
 
-if "input_table" not in st.session_state:
-    st.session_state.input_table = empty_dataframe()
-
-if "customer_name" not in st.session_state:
-    st.session_state.customer_name = ""
-
-if "customer_address" not in st.session_state:
-    st.session_state.customer_address = ""
-
-if "invoice_period" not in st.session_state:
-    st.session_state.invoice_period = ""
-
-if "selected_template" not in st.session_state:
-    st.session_state.selected_template = ""
-
-if "ocr_cache" not in st.session_state:
-    st.session_state.ocr_cache = {}
-
-if "input_editor_version" not in st.session_state:
-    st.session_state.input_editor_version = 0
+for key, default in SESSION_DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 # =========================================================
@@ -723,22 +585,13 @@ if "input_editor_version" not in st.session_state:
 # =========================================================
 
 st.title("🧾 Input Nota")
-
 st.caption(
-    "Masukkan data dari foto, Excel, atau secara manual. "
-    "Semua hasil dapat diperbaiki pada Tabel Koreksi."
+    "Masukkan data dari Excel, CSV, PDF, foto, atau secara manual. "
+    "Semua hasil dapat diperbaiki sebelum disimpan."
 )
 
 st.divider()
-
-
-# =========================================================
-# DATA PELANGGAN
-# =========================================================
-
-st.subheader("1. Data Pelanggan")
-
-customer_col, address_col = st.columns(2)
+st.subheader("1. Data Invoice")
 
 customer_col, address_col, period_col = st.columns(3)
 
@@ -746,14 +599,12 @@ with customer_col:
     st.session_state.customer_name = st.text_input(
         "Nama Pelanggan",
         value=st.session_state.customer_name,
-        placeholder="Contoh: PT Raharja Abadi Futura",
     )
 
 with address_col:
     st.session_state.customer_address = st.text_input(
         "Alamat Pelanggan",
         value=st.session_state.customer_address,
-        placeholder="Contoh: Jl. Perumnas Raya",
     )
 
 with period_col:
@@ -761,6 +612,22 @@ with period_col:
         "Periode",
         value=st.session_state.invoice_period,
         placeholder="Contoh: Juli 2026",
+    )
+
+number_col, vendor_col = st.columns(2)
+
+with number_col:
+    st.session_state.invoice_number = st.text_input(
+        "Nomor Invoice",
+        value=st.session_state.invoice_number,
+        placeholder="Boleh dikosongkan",
+    )
+
+with vendor_col:
+    st.session_state.vendor_name = st.text_input(
+        "Nama Vendor/Toko",
+        value=st.session_state.vendor_name,
+        placeholder="Boleh dikosongkan",
     )
 
 
@@ -774,46 +641,25 @@ st.subheader("2. Template Invoice")
 project_root = Path(__file__).resolve().parents[1]
 template_folder = project_root / "templates"
 template_folder.mkdir(parents=True, exist_ok=True)
-
 template_files = sorted(template_folder.glob("*.docx"))
 
 if template_files:
     template_names = [template.name for template in template_files]
-
-    previous_name = ""
-    if st.session_state.selected_template:
-        previous_name = Path(
-            st.session_state.selected_template
-        ).name
-
-    selected_index = (
-        template_names.index(previous_name)
-        if previous_name in template_names
-        else 0
+    previous_name = (
+        Path(st.session_state.selected_template).name
+        if st.session_state.selected_template
+        else ""
     )
-
+    selected_index = template_names.index(previous_name) if previous_name in template_names else 0
     selected_template_name = st.selectbox(
         "Pilih Template Word",
         options=template_names,
         index=selected_index,
     )
-
-    selected_template_path = (
-        template_folder / selected_template_name
-    )
-
-    st.session_state.selected_template = str(
-        selected_template_path
-    )
-
-    st.success(
-        f"Template aktif: {selected_template_name}"
-    )
+    st.session_state.selected_template = str(template_folder / selected_template_name)
+    st.success(f"Template aktif: {selected_template_name}")
 else:
-    st.warning(
-        "Belum ada template Word. Masukkan file .docx ke folder "
-        f"`{template_folder}`."
-    )
+    st.warning(f"Belum ada template Word di folder `{template_folder}`.")
 
 
 # =========================================================
@@ -826,8 +672,9 @@ st.subheader("3. Masukkan Data")
 method = st.radio(
     "Metode Input",
     options=[
+        "📊 Excel / CSV",
+        "📄 PDF",
         "📷 Foto OCR",
-        "📊 Excel",
         "⌨️ Manual",
     ],
     horizontal=True,
@@ -835,346 +682,251 @@ method = st.radio(
 
 
 # =========================================================
-# INPUT FOTO OCR
+# EXCEL / CSV
 # =========================================================
 
-if method == "📷 Foto OCR":
-    st.markdown("#### Unggah Foto Nota")
+if method == "📊 Excel / CSV":
+    uploaded_file = st.file_uploader(
+        "Pilih file Excel atau CSV",
+        type=["xlsx", "xls", "xlsm", "csv"],
+    )
 
+    if uploaded_file is not None:
+        try:
+            with st.spinner("Membaca dan menyesuaikan data..."):
+                parsed = import_tabular_file(
+                    uploaded_file,
+                    filename=uploaded_file.name,
+                )
+                mapped = service_dataframe_to_ui(
+                    parsed,
+                    note_name=Path(uploaded_file.name).stem,
+                )
+
+            st.dataframe(mapped, hide_index=True, use_container_width=True)
+
+            action_1, action_2 = st.columns(2)
+
+            with action_1:
+                if st.button(
+                    "➕ Tambahkan ke Tabel Koreksi",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    append_rows(mapped)
+                    st.session_state.last_input_method = (
+                        "excel"
+                        if uploaded_file.name.lower().endswith(
+                            (".xlsx", ".xls", ".xlsm")
+                        )
+                        else "import"
+                    )
+                    st.rerun()
+
+            with action_2:
+                if st.button(
+                    "♻️ Ganti Tabel",
+                    use_container_width=True,
+                ):
+                    replace_rows(mapped)
+                    st.session_state.last_input_method = (
+                        "excel"
+                        if uploaded_file.name.lower().endswith(
+                            (".xlsx", ".xls", ".xlsm")
+                        )
+                        else "import"
+                    )
+                    st.rerun()
+
+        except Exception as error:
+            st.error(f"File gagal dibaca: {error}")
+
+
+# =========================================================
+# PDF
+# =========================================================
+
+elif method == "📄 PDF":
+    uploaded_pdf = st.file_uploader("Pilih file PDF", type=["pdf"])
+
+    if uploaded_pdf is not None:
+        pdf_bytes = uploaded_pdf.getvalue()
+        digest = file_hash(pdf_bytes)
+
+        if st.button("🔍 Baca PDF", type="primary", use_container_width=True):
+            try:
+                all_rows = []
+                with st.spinner("Membaca halaman PDF..."):
+                    pages = pdf_pages_to_images(pdf_bytes)
+
+                    for page_number, image in enumerate(pages, start=1):
+                        raw_text = run_ocr(image)
+                        rows = parse_ocr_text(
+                            raw_text,
+                            f"{Path(uploaded_pdf.name).stem} - Halaman {page_number}",
+                        )
+                        if not rows.empty:
+                            all_rows.append(rows)
+
+                combined = (
+                    pd.concat(all_rows, ignore_index=True)
+                    if all_rows
+                    else empty_dataframe(0)
+                )
+                st.session_state.ocr_cache[f"pdf_{digest}"] = combined.to_dict("records")
+            except Exception as error:
+                st.error(f"PDF gagal dibaca: {error}")
+
+        cached_pdf_rows = st.session_state.ocr_cache.get(f"pdf_{digest}", [])
+
+        if cached_pdf_rows:
+            pdf_rows = prepare_dataframe(cached_pdf_rows)
+            st.dataframe(pdf_rows, hide_index=True, use_container_width=True)
+
+            pdf_action_1, pdf_action_2 = st.columns(2)
+
+            with pdf_action_1:
+                if st.button(
+                    "➕ Tambahkan PDF ke Tabel",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    append_rows(pdf_rows)
+                    st.session_state.last_input_method = "pdf"
+                    st.rerun()
+
+            with pdf_action_2:
+                if st.button("♻️ Ganti Tabel dengan PDF", use_container_width=True):
+                    replace_rows(pdf_rows)
+                    st.session_state.last_input_method = "pdf"
+                    st.rerun()
+
+
+# =========================================================
+# FOTO OCR
+# =========================================================
+
+elif method == "📷 Foto OCR":
     uploaded_images = st.file_uploader(
         "Pilih satu atau beberapa foto",
         type=["png", "jpg", "jpeg", "webp"],
         accept_multiple_files=True,
-        help=(
-            "Untuk hasil terbaik, gunakan foto lurus, terang, "
-            "dan tulisan tidak buram."
-        ),
     )
 
     if uploaded_images:
         all_ocr_rows = []
 
-        for image_number, uploaded_image in enumerate(
-            uploaded_images,
-            start=1,
-        ):
+        for image_number, uploaded_image in enumerate(uploaded_images, start=1):
             image_bytes = uploaded_image.getvalue()
             image = Image.open(io.BytesIO(image_bytes))
             digest = file_hash(image_bytes)
-
-            st.markdown(
-                f"##### Foto {image_number}: {uploaded_image.name}"
+            note_name = st.text_input(
+                f"Nama Nota Foto {image_number}",
+                value=Path(uploaded_image.name).stem,
+                key=f"ocr_note_{digest}",
             )
 
-            preview_col, setting_col = st.columns([1.15, 1])
+            st.image(image, caption=uploaded_image.name, use_container_width=True)
 
-            with preview_col:
-                st.image(
-                    image,
-                    caption=uploaded_image.name,
-                    use_container_width=True,
-                )
-
-            with setting_col:
-                category = st.selectbox(
-                    "Kategori",
-                    options=CATEGORIES,
-                    key=f"ocr_category_{digest}",
-                )
-
-                default_note_name = Path(
-                    uploaded_image.name
-                ).stem
-
-                note_name = st.text_input(
-                    "Nama Nota",
-                    value=default_note_name,
-                    key=f"ocr_note_name_{digest}",
-                )
-
-                force_ocr = st.checkbox(
-                    "Baca ulang OCR",
-                    value=False,
-                    key=f"force_ocr_{digest}",
-                )
-
-                ocr_button = st.button(
-                    "🔍 Baca Foto",
-                    key=f"ocr_button_{digest}",
-                    use_container_width=True,
-                )
-
-            if ocr_button:
+            if st.button(
+                f"🔍 Baca Foto {image_number}",
+                key=f"ocr_button_{digest}",
+                use_container_width=True,
+            ):
                 try:
-                    with st.spinner(
-                        f"Membaca {uploaded_image.name}..."
-                    ):
-                        if (
-                            digest not in st.session_state.ocr_cache
-                            or force_ocr
-                        ):
-                            raw_text = run_ocr(image)
-                            st.session_state.ocr_cache[digest] = raw_text
-                        else:
-                            raw_text = (
-                                st.session_state.ocr_cache[digest]
-                            )
-
-                    parsed_rows = parse_ocr_text(
-                        raw_text,
-                        category,
-                        note_name,
-                    )
-
-                    st.session_state.ocr_cache[
-                        f"{digest}_rows"
-                    ] = parsed_rows.to_dict("records")
-
-                    if parsed_rows.empty:
-                        st.warning(
-                            "Tidak ada baris item yang dapat dibaca. "
-                            "Coba foto yang lebih jelas atau koreksi "
-                            "secara manual."
-                        )
-                    else:
-                        st.success(
-                            f"{len(parsed_rows)} baris terdeteksi."
-                        )
-
+                    with st.spinner(f"Membaca {uploaded_image.name}..."):
+                        raw_text = run_ocr(image)
+                        parsed_rows = parse_ocr_text(raw_text, note_name)
+                        st.session_state.ocr_cache[f"{digest}_rows"] = parsed_rows.to_dict("records")
                 except pytesseract.TesseractNotFoundError:
-                    st.error(
-                        "Tesseract belum terpasang. Jalankan di Terminal:\n\n"
-                        "`brew install tesseract`"
-                    )
+                    st.error("Tesseract belum terpasang. Jalankan: brew install tesseract")
                 except Exception as error:
                     st.error(f"OCR gagal: {error}")
 
-            cached_rows = st.session_state.ocr_cache.get(
-                f"{digest}_rows",
-                [],
-            )
-
+            cached_rows = st.session_state.ocr_cache.get(f"{digest}_rows", [])
             if cached_rows:
                 parsed_rows = prepare_dataframe(cached_rows)
-
-                # Terapkan perubahan kategori/nama nota terbaru.
-                parsed_rows["Kategori"] = category
                 parsed_rows["Nama Nota"] = note_name
-
-                st.dataframe(
-                    parsed_rows,
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
+                st.dataframe(parsed_rows, hide_index=True, use_container_width=True)
                 all_ocr_rows.append(parsed_rows)
 
             st.divider()
 
         if all_ocr_rows:
-            combined_ocr_rows = pd.concat(
-                all_ocr_rows,
-                ignore_index=True,
-            )
+            combined_ocr_rows = pd.concat(all_ocr_rows, ignore_index=True)
+            action_1, action_2 = st.columns(2)
 
-            action_col_1, action_col_2 = st.columns(2)
-
-            with action_col_1:
+            with action_1:
                 if st.button(
-                    "➕ Tambahkan Hasil OCR ke Tabel",
+                    "➕ Tambahkan Hasil OCR",
                     type="primary",
                     use_container_width=True,
                 ):
                     append_rows(combined_ocr_rows)
-                    st.success(
-                        "Hasil OCR ditambahkan ke Tabel Koreksi."
-                    )
+                    st.session_state.last_input_method = "ocr"
                     st.rerun()
 
-            with action_col_2:
-                if st.button(
-                    "♻️ Ganti Tabel dengan Hasil OCR",
-                    use_container_width=True,
-                ):
+            with action_2:
+                if st.button("♻️ Ganti Tabel dengan OCR", use_container_width=True):
                     replace_rows(combined_ocr_rows)
-                    st.success(
-                        "Tabel diganti dengan hasil OCR."
-                    )
+                    st.session_state.last_input_method = "ocr"
                     st.rerun()
 
 
 # =========================================================
-# INPUT EXCEL
-# =========================================================
-
-elif method == "📊 Excel":
-    st.markdown("#### Unggah Excel")
-
-    excel_file = st.file_uploader(
-        "Pilih file Excel",
-        type=["xlsx", "xls"],
-        accept_multiple_files=False,
-    )
-
-    if excel_file is not None:
-        try:
-            excel_engine = (
-                "openpyxl"
-                if excel_file.name.lower().endswith(".xlsx")
-                else None
-            )
-
-            raw_excel = pd.read_excel(
-                excel_file,
-                engine=excel_engine,
-            )
-
-            mapped_excel = map_excel_dataframe(raw_excel)
-
-            st.caption("Preview data asli")
-            st.dataframe(
-                raw_excel,
-                hide_index=True,
-                use_container_width=True,
-            )
-
-            st.caption("Preview setelah pemetaan")
-            st.dataframe(
-                mapped_excel,
-                hide_index=True,
-                use_container_width=True,
-            )
-
-            if mapped_excel.empty:
-                st.warning(
-                    "Tidak ada baris yang dapat dipetakan. "
-                    "Pastikan Excel memiliki kolom Uraian, Qty, "
-                    "Harga, atau Jumlah."
-                )
-            else:
-                excel_action_1, excel_action_2 = st.columns(2)
-
-                with excel_action_1:
-                    if st.button(
-                        "➕ Tambahkan Excel ke Tabel",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                        append_rows(mapped_excel)
-                        st.success(
-                            "Data Excel ditambahkan."
-                        )
-                        st.rerun()
-
-                with excel_action_2:
-                    if st.button(
-                        "♻️ Ganti Tabel dengan Excel",
-                        use_container_width=True,
-                    ):
-                        replace_rows(mapped_excel)
-                        st.success(
-                            "Tabel diganti dengan data Excel."
-                        )
-                        st.rerun()
-
-        except ImportError:
-            st.error(
-                "Pustaka pembaca Excel belum lengkap. Jalankan:\n\n"
-                "`pip install openpyxl`"
-            )
-        except Exception as error:
-            st.error(f"Excel gagal dibaca: {error}")
-
-
-# =========================================================
-# INPUT MANUAL
+# MANUAL
 # =========================================================
 
 elif method == "⌨️ Manual":
-    st.markdown("#### Tambah Barang Manual")
+    with st.form("manual_input_form", clear_on_submit=True):
+        left, right = st.columns(2)
 
-    with st.form(
-        "manual_input_form",
-        clear_on_submit=True,
-    ):
-        manual_col_1, manual_col_2 = st.columns(2)
-
-        with manual_col_1:
-            manual_description = st.text_input(
-                "Uraian Barang",
-                placeholder="Contoh: Kertas A4 80 gsm",
-            )
-
+        with left:
+            manual_description = st.text_input("Uraian Barang")
             manual_quantity = st.number_input(
                 "Kuantitas",
                 min_value=0.01,
                 value=1.0,
                 step=1.0,
             )
+            manual_unit = st.selectbox("Satuan", options=UNITS)
+            manual_category = st.selectbox("Kategori", options=CATEGORIES)
 
-            manual_unit = st.selectbox(
-                "Satuan",
-                options=UNITS,
-            )
-
-            manual_category = st.selectbox(
-                "Kategori",
-                options=CATEGORIES,
-            )
-
-        with manual_col_2:
+        with right:
             manual_price = st.number_input(
                 "Harga Satuan",
                 min_value=0.0,
                 value=0.0,
                 step=1000.0,
             )
-
             manual_total = st.number_input(
                 "Jumlah",
                 min_value=0.0,
                 value=0.0,
                 step=1000.0,
-                help=(
-                    "Isi Harga Satuan atau Jumlah. "
-                    "Nilai lainnya akan dihitung otomatis."
-                ),
             )
+            manual_note_name = st.text_input("Nama Nota")
+            manual_lock = st.checkbox("Kunci Harga", value=False)
 
-            manual_note_name = st.text_input(
-                "Nama Nota",
-                placeholder="Contoh: Nota Toko ABC",
-            )
-
-            manual_lock = st.checkbox(
-                "Kunci Harga",
-                value=False,
-            )
-
-        manual_submit = st.form_submit_button(
+        submitted = st.form_submit_button(
             "➕ Tambahkan ke Tabel",
             type="primary",
             use_container_width=True,
         )
 
-        if manual_submit:
+        if submitted:
             if not manual_description.strip():
                 st.error("Uraian barang wajib diisi.")
             elif manual_price <= 0 and manual_total <= 0:
-                st.error(
-                    "Isi Harga Satuan atau Jumlah."
-                )
+                st.error("Isi Harga Satuan atau Jumlah.")
             else:
-                quantity = max(
-                    numeric_value(manual_quantity),
-                    1,
-                )
+                quantity = max(numeric_value(manual_quantity), 1)
                 price = numeric_value(manual_price)
                 total = numeric_value(manual_total)
 
                 if price > 0:
                     total = quantity * price
-                elif total > 0:
+                else:
                     price = total / quantity
 
                 manual_row = pd.DataFrame(
@@ -1192,10 +944,18 @@ elif method == "⌨️ Manual":
                     ]
                 )
 
+                # Prediksi kategori hanya bila pengguna membiarkan default.
+                if manual_category == "Belum Dikategorikan":
+                    predicted = apply_predicted_categories(
+                        ui_dataframe_to_service(manual_row, "manual")
+                    )
+                    manual_row = service_dataframe_to_ui(
+                        predicted,
+                        note_name=manual_note_name.strip(),
+                    )
+
                 append_rows(manual_row)
-                st.success(
-                    "Barang ditambahkan ke Tabel Koreksi."
-                )
+                st.session_state.last_input_method = "manual"
                 st.rerun()
 
 
@@ -1205,21 +965,12 @@ elif method == "⌨️ Manual":
 
 st.divider()
 st.subheader("4. Tabel Koreksi")
-
 st.caption(
-    "Semua kolom dapat diedit. Isi Kuantitas bersama Harga Satuan "
-    "atau Jumlah. Setelah nilai selesai diketik dan sel berpindah, "
-    "kolom pasangannya akan dihitung otomatis."
+    "Semua kolom dapat diedit. Kategori otomatis tetap bisa diganti manual."
 )
 
-current_table = prepare_dataframe(
-    st.session_state.input_table
-)
-
-editor_key = (
-    f"input_nota_editor_"
-    f"{st.session_state.input_editor_version}"
-)
+current_table = prepare_dataframe(st.session_state.input_table)
+editor_key = f"input_nota_editor_{st.session_state.input_editor_version}"
 
 edited_table = st.data_editor(
     current_table,
@@ -1228,11 +979,7 @@ edited_table = st.data_editor(
     use_container_width=True,
     key=editor_key,
     column_config={
-        "Uraian": st.column_config.TextColumn(
-            "Uraian",
-            required=True,
-            width="large",
-        ),
+        "Uraian": st.column_config.TextColumn("Uraian", required=True, width="large"),
         "Kuantitas": st.column_config.NumberColumn(
             "Kuantitas",
             min_value=0.01,
@@ -1261,23 +1008,16 @@ edited_table = st.data_editor(
             options=CATEGORIES,
             required=True,
         ),
-        "Nama Nota": st.column_config.TextColumn(
-            "Nama Nota",
-            width="medium",
-        ),
-        "Kunci": st.column_config.CheckboxColumn(
-            "Kunci Harga",
-        ),
+        "Nama Nota": st.column_config.TextColumn("Nama Nota", width="medium"),
+        "Kunci": st.column_config.CheckboxColumn("Kunci Harga"),
     },
 )
 
 if dataframe_changed(current_table, edited_table):
-    synchronized_table = synchronize_dataframe(
+    st.session_state.input_table = synchronize_dataframe(
         current_table,
         edited_table,
     )
-
-    st.session_state.input_table = synchronized_table
     st.session_state.input_editor_version += 1
     st.rerun()
 
@@ -1286,99 +1026,66 @@ if dataframe_changed(current_table, edited_table):
 # AKSI TABEL
 # =========================================================
 
-button_col_1, button_col_2, button_col_3 = st.columns(3)
+button_1, button_2, button_3, button_4 = st.columns(4)
 
-with button_col_1:
-    if st.button(
-        "➕ Tambah Baris Kosong",
-        use_container_width=True,
-    ):
+with button_1:
+    if st.button("➕ Tambah Baris", use_container_width=True):
         append_rows(empty_dataframe())
         st.rerun()
 
-with button_col_2:
-    if st.button(
-        "🧮 Hitung Ulang Semua",
-        use_container_width=True,
-    ):
-        table = prepare_dataframe(
-            st.session_state.input_table
+with button_2:
+    if st.button("🏷️ Isi Kategori Otomatis", use_container_width=True):
+        predicted = apply_predicted_categories(
+            ui_dataframe_to_service(
+                st.session_state.input_table,
+                st.session_state.last_input_method,
+            )
         )
+        replace_rows(service_dataframe_to_ui(predicted))
+        st.rerun()
 
+with button_3:
+    if st.button("🧮 Hitung Ulang", use_container_width=True):
+        table = prepare_dataframe(st.session_state.input_table)
         for index in table.index:
-            qty = numeric_value(
-                table.at[index, "Kuantitas"]
-            )
-            price = numeric_value(
-                table.at[index, "Harga"]
-            )
-            total = numeric_value(
-                table.at[index, "Jumlah"]
-            )
-
-            if qty <= 0:
-                qty = 1
-                table.at[index, "Kuantitas"] = qty
+            quantity = max(numeric_value(table.at[index, "Kuantitas"]), 1)
+            price = numeric_value(table.at[index, "Harga"])
+            total = numeric_value(table.at[index, "Jumlah"])
+            table.at[index, "Kuantitas"] = quantity
 
             if price > 0:
-                table.at[index, "Jumlah"] = qty * price
+                table.at[index, "Jumlah"] = quantity * price
             elif total > 0:
-                table.at[index, "Harga"] = total / qty
+                table.at[index, "Harga"] = total / quantity
 
         replace_rows(table)
         st.rerun()
 
-with button_col_3:
-    if st.button(
-        "🗑️ Kosongkan Tabel",
-        use_container_width=True,
-    ):
+with button_4:
+    if st.button("🗑️ Kosongkan", use_container_width=True):
         st.session_state.input_table = empty_dataframe()
         st.session_state.input_editor_version += 1
         st.rerun()
 
 
 # =========================================================
-# RINGKASAN
+# RINGKASAN DAN VALIDASI
 # =========================================================
 
 st.divider()
 st.subheader("5. Ringkasan")
 
-summary_table = prepare_dataframe(
-    st.session_state.input_table
-)
-
-valid_rows = summary_table[
-    summary_table["Uraian"].str.strip().ne("")
-].copy()
+summary_table = prepare_dataframe(st.session_state.input_table)
+valid_rows = summary_table[summary_table["Uraian"].str.strip().ne("")].copy()
 
 item_count = len(valid_rows)
-total_quantity = valid_rows["Kuantitas"].apply(
-    numeric_value
-).sum()
-grand_total = valid_rows["Jumlah"].apply(
-    numeric_value
-).sum()
+total_quantity = valid_rows["Kuantitas"].apply(numeric_value).sum()
+grand_total = valid_rows["Jumlah"].apply(numeric_value).sum()
 
-metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
-
-with metric_col_1:
-    st.metric("Jumlah Baris", item_count)
-
-with metric_col_2:
-    st.metric(
-        "Total Kuantitas",
-        f"{total_quantity:,.2f}".replace(",", "."),
-    )
-
-with metric_col_3:
-    st.metric("Total Invoice", rupiah(grand_total))
-
-
-# =========================================================
-# VALIDASI DAN SIMPAN KE MATCHING
-# =========================================================
+metric_1, metric_2, metric_3 = st.columns(3)
+metric_1.metric("Jumlah Baris", item_count)
+metric_2.metric("Total Kuantitas", f"{total_quantity:,.2f}".replace(",", "."))
+metric_3.metric("Total Invoice", rupiah(grand_total))
 
 st.divider()
 st.subheader("6. Simpan dan Lanjutkan")
@@ -1387,84 +1094,83 @@ validation_errors = []
 
 if not st.session_state.customer_name.strip():
     validation_errors.append("Nama pelanggan belum diisi.")
-
 if not st.session_state.invoice_period.strip():
     validation_errors.append("Periode belum diisi.")
-
 if valid_rows.empty:
     validation_errors.append("Belum ada barang yang dapat disimpan.")
-
 if not st.session_state.selected_template:
     validation_errors.append("Template invoice belum dipilih.")
-
-invalid_description = valid_rows[
-    valid_rows["Uraian"].str.strip().eq("")
-]
-if not invalid_description.empty:
-    validation_errors.append(
-        "Masih ada baris tanpa uraian."
-    )
-
-invalid_quantity = valid_rows[
+if not valid_rows.empty and (
     valid_rows["Kuantitas"].apply(numeric_value) <= 0
-]
-if not invalid_quantity.empty:
-    validation_errors.append(
-        "Masih ada kuantitas nol atau negatif."
-    )
-
-invalid_total = valid_rows[
+).any():
+    validation_errors.append("Masih ada kuantitas nol atau negatif.")
+if not valid_rows.empty and (
     valid_rows["Jumlah"].apply(numeric_value) <= 0
-]
-if not invalid_total.empty:
-    validation_errors.append(
-        "Masih ada baris dengan Jumlah nol."
-    )
+).any():
+    validation_errors.append("Masih ada baris dengan Jumlah nol.")
 
-if validation_errors:
-    for validation_error in validation_errors:
-        st.warning(validation_error)
+for error in validation_errors:
+    st.warning(error)
 
 save_button = st.button(
-    "💾 Simpan Data untuk Matching",
+    "💾 Simpan ke Database dan Lanjutkan ke Matching",
     type="primary",
     use_container_width=True,
     disabled=bool(validation_errors),
 )
 
 if save_button:
-    final_table = prepare_dataframe(valid_rows)
-
-    st.session_state.invoice_items = final_table.to_dict(
-        orient="records"
-    )
-
-    st.session_state.invoice_metadata = {
-        "customer_name": st.session_state.customer_name,
-        "customer_address": st.session_state.customer_address,
-        "period": st.session_state.invoice_period,
-        "selected_template": st.session_state.selected_template,
-    }
-
-    # Nama-nama ini disediakan agar kompatibel
-    # dengan halaman Matching, Revision, dan Download.
-    st.session_state.final_items = (
-        st.session_state.invoice_items
-    )
-
-    st.session_state.matched_items = (
-        st.session_state.invoice_items
-    )
-
-    st.success(
-        f"{len(final_table)} baris berhasil disimpan. "
-        "Silakan buka halaman Matching."
-    )
-
     try:
-        st.switch_page("pages/2_🔗_Matching.py")
-    except Exception:
-        st.info(
-            "Data sudah tersimpan. Buka halaman Matching "
-            "melalui menu di sebelah kiri."
+        final_table = prepare_dataframe(valid_rows)
+        database_table = ui_dataframe_to_service(
+            final_table,
+            st.session_state.last_input_method,
         )
+
+        with st.spinner("Menyimpan invoice ke Supabase..."):
+            save_result = save_imported_invoice(
+                database_table,
+                invoice_number=st.session_state.invoice_number.strip() or None,
+                invoice_date=date.today(),
+                vendor_name=st.session_state.vendor_name.strip() or None,
+                customer_name=st.session_state.customer_name.strip(),
+                notes=(
+                    f"Periode: {st.session_state.invoice_period}; "
+                    f"Alamat: {st.session_state.customer_address}"
+                ),
+            )
+
+        # UUID internal Supabase dibuat otomatis.
+        # Pengguna tidak perlu mengisi atau melihat ID ini.
+        saved_invoice_id = str(save_result["invoice_id"])
+        st.session_state.current_invoice_id = saved_invoice_id
+
+        # Alias kompatibilitas untuk halaman Matching/Revision.
+        st.session_state.invoice_id = saved_invoice_id
+        st.session_state.saved_invoice_id = saved_invoice_id
+
+        st.session_state.invoice_items = final_table.to_dict(orient="records")
+        st.session_state.invoice_metadata = {
+            "invoice_id": saved_invoice_id,
+            "invoice_number": st.session_state.invoice_number,
+            "customer_name": st.session_state.customer_name,
+            "customer_address": st.session_state.customer_address,
+            "vendor_name": st.session_state.vendor_name,
+            "period": st.session_state.invoice_period,
+            "selected_template": st.session_state.selected_template,
+        }
+        st.session_state.final_items = st.session_state.invoice_items
+        st.session_state.matched_items = st.session_state.invoice_items
+
+        st.success(
+            f"{save_result['saved_items']} item tersimpan ke database. "
+            f"Total {rupiah(save_result['total'])}."
+        )
+
+        try:
+            st.switch_page("pages/2_🧠_Matching.py")
+        except Exception:
+            st.info("Data sudah tersimpan. Buka halaman Matching dari menu kiri.")
+
+    except Exception as error:
+        st.error(f"Gagal menyimpan ke Supabase: {error}")

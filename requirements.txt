@@ -8,3 +8,6 @@ Pillow
 pytesseract
 rapidfuzz
 numpy
+supabase
+python-dotenv
+pymupdf
