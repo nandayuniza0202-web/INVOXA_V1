@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from typing import Any
 
 import pandas as pd
@@ -181,6 +182,7 @@ def add_database_products(
     gap: float,
     share_percent: float,
     max_new_products: int,
+    random_seed: int,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Prioritas pertama:
@@ -210,9 +212,18 @@ def add_database_products(
     selected_rows: list[dict[str, Any]] = []
     added_total = 0.0
 
+    random_generator = random.Random(random_seed)
+
+    candidates["Prioritas Acak"] = candidates[
+        "Skor Rekomendasi"
+    ].apply(
+        lambda score: safe_float(score)
+        + random_generator.uniform(0.0, 1.0)
+    )
+
     candidates = candidates.sort_values(
         by=[
-            "Skor Rekomendasi",
+            "Prioritas Acak",
             "Jumlah Usulan",
         ],
         ascending=[
@@ -690,6 +701,7 @@ def build_automatic_database_simulation(
     max_new_products: int,
     rounding_step: int,
     tolerance: float,
+    recommendation_seed: int,
 ) -> dict[str, Any]:
     """
     Urutan otomatis:
@@ -729,6 +741,7 @@ def build_automatic_database_simulation(
         gap=gap,
         share_percent=new_product_share,
         max_new_products=max_new_products,
+        random_seed=recommendation_seed,
     )
     messages.extend(addition_messages)
 
@@ -838,6 +851,8 @@ def build_automatic_database_simulation(
         "new_product_share": new_product_share,
         "rounding_step": rounding_step,
         "tolerance": tolerance,
+        "max_new_products": max_new_products,
+        "recommendation_seed": recommendation_seed,
     }
 
 
@@ -853,6 +868,9 @@ if "global_budget_simulation" not in st.session_state:
 
 if "budget_simulation" not in st.session_state:
     st.session_state.budget_simulation = None
+
+if "recommendation_seed" not in st.session_state:
+    st.session_state.recommendation_seed = 0
 
 
 # =========================================================
@@ -1067,6 +1085,8 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
             )
 
         else:
+            st.session_state.recommendation_seed += 1
+
             with st.spinner(
                 "Mengambil rekomendasi database dan "
                 "menyusun simulasi..."
@@ -1093,6 +1113,9 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
                         ),
                         tolerance=float(
                             tolerance
+                        ),
+                        recommendation_seed=int(
+                            st.session_state.recommendation_seed
                         ),
                     )
                 )
@@ -1132,6 +1155,12 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
                 ],
                 "tolerance": simulation[
                     "tolerance"
+                ],
+                "max_new_products": simulation[
+                    "max_new_products"
+                ],
+                "recommendation_seed": simulation[
+                    "recommendation_seed"
                 ],
             }
 
@@ -1221,6 +1250,100 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
             [],
         ):
             st.caption(f"• {message}")
+
+        if st.button(
+            "🔄 Refresh Barang Rekomendasi",
+            use_container_width=True,
+            help=(
+                "Mengganti kombinasi barang baru dari database "
+                "tanpa mengubah target pagu dan batas penyesuaian."
+            ),
+        ):
+            st.session_state.recommendation_seed += 1
+
+            with st.spinner(
+                "Mengganti barang rekomendasi dan menghitung ulang..."
+            ):
+                refreshed_simulation = (
+                    build_automatic_database_simulation(
+                        source=all_items,
+                        invoice_id=invoice_id,
+                        target=float(
+                            simulation["target"]
+                        ),
+                        max_price_increase=float(
+                            simulation["max_price_increase"]
+                        ),
+                        max_quantity_increase=float(
+                            simulation["max_quantity_increase"]
+                        ),
+                        new_product_share=float(
+                            simulation["new_product_share"]
+                        ),
+                        max_new_products=int(
+                            simulation["max_new_products"]
+                        ),
+                        rounding_step=int(
+                            simulation["rounding_step"]
+                        ),
+                        tolerance=float(
+                            simulation["tolerance"]
+                        ),
+                        recommendation_seed=int(
+                            st.session_state.recommendation_seed
+                        ),
+                    )
+                )
+
+            st.session_state.global_budget_simulation = {
+                "data": refreshed_simulation[
+                    "dataframe"
+                ].to_dict("records"),
+                "original_total": refreshed_simulation[
+                    "original_total"
+                ],
+                "revised_total": refreshed_simulation[
+                    "revised_total"
+                ],
+                "target": refreshed_simulation[
+                    "target"
+                ],
+                "difference": refreshed_simulation[
+                    "difference"
+                ],
+                "reached": refreshed_simulation[
+                    "reached"
+                ],
+                "recommendation_count": refreshed_simulation[
+                    "recommendation_count"
+                ],
+                "messages": refreshed_simulation[
+                    "messages"
+                ],
+                "max_price_increase": refreshed_simulation[
+                    "max_price_increase"
+                ],
+                "max_quantity_increase": refreshed_simulation[
+                    "max_quantity_increase"
+                ],
+                "new_product_share": refreshed_simulation[
+                    "new_product_share"
+                ],
+                "rounding_step": refreshed_simulation[
+                    "rounding_step"
+                ],
+                "tolerance": refreshed_simulation[
+                    "tolerance"
+                ],
+                "max_new_products": refreshed_simulation[
+                    "max_new_products"
+                ],
+                "recommendation_seed": refreshed_simulation[
+                    "recommendation_seed"
+                ],
+            }
+
+            st.rerun()
 
         category_summary = (
             simulation_df.groupby(

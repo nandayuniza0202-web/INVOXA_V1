@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from collections import Counter
 from typing import Any
 
@@ -9,14 +10,19 @@ from database.supabase_client import supabase
 from services.category_service import normalize_text
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+    """Mengubah nilai menjadi float secara aman."""
+
     if value is None:
         return default
 
     try:
         if pd.isna(value):
             return default
-    except Exception:
+    except (TypeError, ValueError):
         pass
 
     try:
@@ -27,7 +33,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def get_products_with_history() -> list[dict[str, Any]]:
     """
-    Mengambil master barang beserta kategori dan riwayat harga.
+    Mengambil master barang aktif beserta kategori dan riwayat harga.
     """
 
     response = (
@@ -45,7 +51,9 @@ def get_products_with_history() -> list[dict[str, Any]]:
     return response.data or []
 
 
-def get_invoice_items(invoice_id: str) -> list[dict[str, Any]]:
+def get_invoice_items(
+    invoice_id: str,
+) -> list[dict[str, Any]]:
     """
     Mengambil item yang sudah ada pada invoice tertentu.
     """
@@ -63,10 +71,10 @@ def get_invoice_items(invoice_id: str) -> list[dict[str, Any]]:
     return response.data or []
 
 
-def get_invoice(invoice_id: str) -> dict[str, Any] | None:
-    """
-    Mengambil metadata invoice.
-    """
+def get_invoice(
+    invoice_id: str,
+) -> dict[str, Any] | None:
+    """Mengambil metadata invoice."""
 
     response = (
         supabase.table("invoices")
@@ -83,16 +91,32 @@ def calculate_price_statistics(
     price_history: list[dict[str, Any]] | None,
 ) -> dict[str, float]:
     """
-    Menghitung statistik harga dari riwayat produk.
+    Menghitung statistik harga berdasarkan riwayat produk.
+
+    Riwayat diurutkan berdasarkan recorded_date agar latest_price
+    benar-benar memakai harga terbaru.
     """
 
-    prices = [
-        _safe_float(item.get("unit_price"))
-        for item in (price_history or [])
-        if _safe_float(item.get("unit_price")) > 0
-    ]
+    valid_history = []
 
-    if not prices:
+    for item in price_history or []:
+        unit_price = _safe_float(
+            item.get("unit_price")
+        )
+
+        if unit_price <= 0:
+            continue
+
+        valid_history.append(
+            {
+                "unit_price": unit_price,
+                "recorded_date": str(
+                    item.get("recorded_date") or ""
+                ),
+            }
+        )
+
+    if not valid_history:
         return {
             "minimum_price": 0.0,
             "maximum_price": 0.0,
@@ -100,19 +124,28 @@ def calculate_price_statistics(
             "latest_price": 0.0,
         }
 
-    latest_price = prices[-1]
+    valid_history.sort(
+        key=lambda item: item["recorded_date"]
+    )
+
+    prices = [
+        item["unit_price"]
+        for item in valid_history
+    ]
 
     return {
         "minimum_price": min(prices),
         "maximum_price": max(prices),
         "average_price": sum(prices) / len(prices),
-        "latest_price": latest_price,
+        "latest_price": prices[-1],
     }
 
 
 def get_existing_product_ids(
     invoice_items: list[dict[str, Any]],
 ) -> set[str]:
+    """Mengambil seluruh product_id yang sudah ada di invoice."""
+
     return {
         str(item["product_id"])
         for item in invoice_items
@@ -123,28 +156,44 @@ def get_existing_product_ids(
 def get_existing_descriptions(
     invoice_items: list[dict[str, Any]],
 ) -> set[str]:
+    """Mengambil uraian barang yang sudah ada dalam bentuk normal."""
+
     return {
-        normalize_text(item.get("raw_description", ""))
+        normalize_text(
+            item.get("raw_description", "")
+        )
         for item in invoice_items
-        if normalize_text(item.get("raw_description", ""))
+        if normalize_text(
+            item.get("raw_description", "")
+        )
     }
+
+
+def get_category_name(
+    record: dict[str, Any],
+) -> str | None:
+    """Mengambil nama kategori dari hasil relasi Supabase."""
+
+    category_data = record.get("categories")
+
+    if isinstance(category_data, dict):
+        category_name = category_data.get("name")
+
+        if category_name:
+            return str(category_name)
+
+    return None
 
 
 def get_category_frequencies(
     invoice_items: list[dict[str, Any]],
 ) -> Counter:
-    """
-    Menghitung kategori yang dominan pada invoice aktif.
-    """
+    """Menghitung kategori dominan pada invoice aktif."""
 
     categories = []
 
     for item in invoice_items:
-        category_data = item.get("categories")
-        category_name = None
-
-        if isinstance(category_data, dict):
-            category_name = category_data.get("name")
+        category_name = get_category_name(item)
 
         if category_name:
             categories.append(category_name)
@@ -158,22 +207,32 @@ def score_product(
     budget_gap: float,
 ) -> float:
     """
-    Memberi skor awal untuk rekomendasi produk.
+    Memberi skor dasar terhadap kandidat produk.
+
+    Pertimbangan:
+    - frekuensi penggunaan;
+    - kedekatan dengan kategori invoice;
+    - kemampuan harga mengisi sisa pagu.
     """
 
     score = 0.0
 
-    usage_count = int(product.get("usage_count") or 0)
+    usage_count = int(
+        product.get("usage_count") or 0
+    )
+
     score += min(usage_count, 20) * 1.5
 
-    category_data = product.get("categories")
-    category_name = None
-
-    if isinstance(category_data, dict):
-        category_name = category_data.get("name")
+    category_name = get_category_name(product)
 
     if category_name:
-        score += category_frequencies.get(category_name, 0) * 5
+        score += (
+            category_frequencies.get(
+                category_name,
+                0,
+            )
+            * 5
+        )
 
     price_stats = calculate_price_statistics(
         product.get("price_history")
@@ -192,58 +251,196 @@ def score_product(
 
         if 0.05 <= ratio <= 0.40:
             score += 8
+
         elif ratio <= 0.75:
             score += 4
 
     return score
 
 
+def _randomize_recommendations(
+    recommendations: list[dict[str, Any]],
+    limit: int,
+    random_seed: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Mengacak kandidat secara terkontrol.
+
+    Kandidat dengan skor tinggi tetap mendapat peluang lebih besar,
+    tetapi hasil dapat berubah setiap kali tombol refresh ditekan.
+    """
+
+    if not recommendations or limit <= 0:
+        return []
+
+    generator = random.Random(random_seed)
+
+    ordered = sorted(
+        recommendations,
+        key=lambda item: (
+            _safe_float(item.get("score")),
+            int(item.get("usage_count") or 0),
+        ),
+        reverse=True,
+    )
+
+    pool_size = min(
+        len(ordered),
+        max(limit * 4, limit),
+    )
+
+    candidate_pool = ordered[:pool_size]
+
+    weighted_candidates = []
+
+    for index, item in enumerate(candidate_pool):
+        base_score = max(
+            _safe_float(item.get("score")),
+            0.0,
+        )
+
+        rank_bonus = (
+            pool_size - index
+        ) / max(pool_size, 1)
+
+        random_bonus = generator.uniform(
+            0.0,
+            8.0,
+        )
+
+        weighted_score = (
+            base_score
+            + rank_bonus
+            + random_bonus
+        )
+
+        weighted_candidates.append(
+            (
+                weighted_score,
+                item,
+            )
+        )
+
+    weighted_candidates.sort(
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+
+    return [
+        item
+        for _, item in weighted_candidates[:limit]
+    ]
+
+
 def recommend_new_products(
     invoice_id: str,
     limit: int = 10,
+    random_seed: int | None = None,
+    exclude_product_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Merekomendasikan barang baru yang belum ada pada invoice aktif.
+
+    Parameter:
+    - random_seed:
+      mengubah variasi hasil rekomendasi secara terkontrol;
+    - exclude_product_ids:
+      mengecualikan barang tertentu, misalnya barang yang baru saja
+      ditampilkan agar refresh berikutnya lebih berbeda.
+
+    Pemanggilan lama tanpa parameter tambahan tetap didukung.
     """
 
     invoice = get_invoice(invoice_id)
 
     if not invoice:
-        raise ValueError("Invoice tidak ditemukan.")
+        raise ValueError(
+            "Invoice tidak ditemukan."
+        )
 
-    invoice_items = get_invoice_items(invoice_id)
+    invoice_items = get_invoice_items(
+        invoice_id
+    )
+
     products = get_products_with_history()
 
-    existing_product_ids = get_existing_product_ids(invoice_items)
-    existing_descriptions = get_existing_descriptions(invoice_items)
-    category_frequencies = get_category_frequencies(invoice_items)
+    existing_product_ids = (
+        get_existing_product_ids(
+            invoice_items
+        )
+    )
 
-    target_budget = _safe_float(invoice.get("target_budget"))
+    excluded_ids = {
+        str(product_id)
+        for product_id in (
+            exclude_product_ids or set()
+        )
+        if product_id
+    }
+
+    existing_product_ids.update(
+        excluded_ids
+    )
+
+    existing_descriptions = (
+        get_existing_descriptions(
+            invoice_items
+        )
+    )
+
+    category_frequencies = (
+        get_category_frequencies(
+            invoice_items
+        )
+    )
+
+    target_budget = _safe_float(
+        invoice.get("target_budget")
+    )
+
     current_total = _safe_float(
         invoice.get("final_total")
         or invoice.get("original_total")
     )
 
-    budget_gap = max(target_budget - current_total, 0)
+    budget_gap = max(
+        target_budget - current_total,
+        0.0,
+    )
 
-    recommendations = []
+    recommendations: list[
+        dict[str, Any]
+    ] = []
 
     for product in products:
-        product_id = str(product.get("id") or "")
+        product_id = str(
+            product.get("id") or ""
+        )
+
         normalized_name = normalize_text(
             product.get("normalized_name")
             or product.get("product_name")
             or ""
         )
 
-        if not product_id or product_id in existing_product_ids:
+        if (
+            not product_id
+            or product_id
+            in existing_product_ids
+        ):
             continue
 
-        if normalized_name in existing_descriptions:
+        if (
+            normalized_name
+            and normalized_name
+            in existing_descriptions
+        ):
             continue
 
-        price_stats = calculate_price_statistics(
-            product.get("price_history")
+        price_stats = (
+            calculate_price_statistics(
+                product.get("price_history")
+            )
         )
 
         reference_price = (
@@ -254,43 +451,81 @@ def recommend_new_products(
         if reference_price <= 0:
             continue
 
-        category_data = product.get("categories")
-        category_name = None
-
-        if isinstance(category_data, dict):
-            category_name = category_data.get("name")
+        category_name = (
+            get_category_name(product)
+        )
 
         score = score_product(
             product=product,
-            category_frequencies=category_frequencies,
+            category_frequencies=(
+                category_frequencies
+            ),
             budget_gap=budget_gap,
         )
 
         suggested_quantity = 1.0
 
-        if budget_gap > 0 and reference_price > 0:
-            suggested_quantity = max(
-                1,
-                min(
-                    int(budget_gap // reference_price),
-                    10,
-                ),
+        if (
+            budget_gap > 0
+            and reference_price > 0
+        ):
+            suggested_quantity = float(
+                max(
+                    1,
+                    min(
+                        int(
+                            budget_gap
+                            // reference_price
+                        ),
+                        10,
+                    ),
+                )
             )
 
         estimated_total = (
-            suggested_quantity * reference_price
+            suggested_quantity
+            * reference_price
         )
+
+        reason_parts = [
+            "Barang tersedia pada database INVOXA"
+        ]
+
+        if category_name:
+            reason_parts.append(
+                f"kategori {category_name}"
+            )
+
+        if int(
+            product.get("usage_count") or 0
+        ) > 0:
+            reason_parts.append(
+                "pernah digunakan sebelumnya"
+            )
+
+        if (
+            budget_gap > 0
+            and reference_price <= budget_gap
+        ):
+            reason_parts.append(
+                "harga sesuai sisa pagu"
+            )
 
         recommendations.append(
             {
                 "product_id": product_id,
-                "product_name": product.get("product_name"),
+                "product_name": (
+                    product.get("product_name")
+                ),
                 "category": (
                     category_name
                     or "Belum Dikategorikan"
                 ),
-                "unit": product.get("default_unit") or "pcs",
-                "suggested_quantity": float(
+                "unit": (
+                    product.get("default_unit")
+                    or "pcs"
+                ),
+                "suggested_quantity": (
                     suggested_quantity
                 ),
                 "suggested_unit_price": float(
@@ -300,38 +535,43 @@ def recommend_new_products(
                     estimated_total
                 ),
                 "average_price": float(
-                    price_stats["average_price"]
+                    price_stats[
+                        "average_price"
+                    ]
                 ),
                 "minimum_price": float(
-                    price_stats["minimum_price"]
+                    price_stats[
+                        "minimum_price"
+                    ]
                 ),
                 "maximum_price": float(
-                    price_stats["maximum_price"]
+                    price_stats[
+                        "maximum_price"
+                    ]
+                ),
+                "latest_price": float(
+                    price_stats[
+                        "latest_price"
+                    ]
                 ),
                 "usage_count": int(
-                    product.get("usage_count") or 0
+                    product.get(
+                        "usage_count"
+                    )
+                    or 0
                 ),
                 "score": float(score),
-                "reason": (
-                    "Barang pernah digunakan pada invoice sebelumnya"
-                    + (
-                        f" dan sesuai kategori {category_name}"
-                        if category_name
-                        else ""
-                    )
+                "reason": "; ".join(
+                    reason_parts
                 ),
             }
         )
 
-    recommendations.sort(
-        key=lambda item: (
-            item["score"],
-            item["usage_count"],
-        ),
-        reverse=True,
+    return _randomize_recommendations(
+        recommendations=recommendations,
+        limit=max(int(limit), 0),
+        random_seed=random_seed,
     )
-
-    return recommendations[:limit]
 
 
 def recommend_price_and_quantity_changes(
@@ -345,9 +585,14 @@ def recommend_price_and_quantity_changes(
     invoice = get_invoice(invoice_id)
 
     if not invoice:
-        raise ValueError("Invoice tidak ditemukan.")
+        raise ValueError(
+            "Invoice tidak ditemukan."
+        )
 
-    invoice_items = get_invoice_items(invoice_id)
+    invoice_items = get_invoice_items(
+        invoice_id
+    )
+
     products = get_products_with_history()
 
     product_map = {
@@ -356,76 +601,130 @@ def recommend_price_and_quantity_changes(
         if product.get("id")
     }
 
-    target_budget = _safe_float(invoice.get("target_budget"))
+    target_budget = _safe_float(
+        invoice.get("target_budget")
+    )
+
     current_total = _safe_float(
         invoice.get("final_total")
         or invoice.get("original_total")
     )
 
-    budget_gap = target_budget - current_total
+    budget_gap = (
+        target_budget - current_total
+    )
 
-    recommendations = []
+    recommendations: list[
+        dict[str, Any]
+    ] = []
 
     for item in invoice_items:
-        product_id = str(item.get("product_id") or "")
-
-        if not product_id or product_id not in product_map:
-            continue
-
-        product = product_map[product_id]
-
-        price_stats = calculate_price_statistics(
-            product.get("price_history")
+        product_id = str(
+            item.get("product_id") or ""
         )
 
-        average_price = price_stats["average_price"]
+        if (
+            not product_id
+            or product_id not in product_map
+        ):
+            continue
+
+        product = product_map[
+            product_id
+        ]
+
+        price_stats = (
+            calculate_price_statistics(
+                product.get("price_history")
+            )
+        )
+
+        average_price = (
+            price_stats["average_price"]
+        )
 
         if average_price <= 0:
             continue
 
         current_quantity = _safe_float(
             item.get("quantity"),
-            1,
+            1.0,
         )
+
         current_unit_price = _safe_float(
             item.get("unit_price")
         )
 
-        suggested_unit_price = current_unit_price
-        suggested_quantity = current_quantity
+        suggested_unit_price = (
+            current_unit_price
+        )
+
+        suggested_quantity = (
+            current_quantity
+        )
+
         reason_parts = []
 
-        if current_unit_price > average_price * 1.15:
-            suggested_unit_price = average_price
-            reason_parts.append(
-                "harga saat ini lebih tinggi dari rata-rata database"
+        if (
+            current_unit_price
+            > average_price * 1.15
+        ):
+            suggested_unit_price = (
+                average_price
             )
 
-        elif current_unit_price < average_price * 0.85:
-            suggested_unit_price = average_price
             reason_parts.append(
-                "harga saat ini lebih rendah dari rata-rata database"
+                "harga saat ini lebih tinggi "
+                "dari rata-rata database"
             )
 
-        if budget_gap > 0 and suggested_unit_price > 0:
+        elif (
+            current_unit_price
+            < average_price * 0.85
+        ):
+            suggested_unit_price = (
+                average_price
+            )
+
+            reason_parts.append(
+                "harga saat ini lebih rendah "
+                "dari rata-rata database"
+            )
+
+        if (
+            budget_gap > 0
+            and suggested_unit_price > 0
+        ):
             additional_quantity = int(
-                budget_gap // suggested_unit_price
+                budget_gap
+                // suggested_unit_price
             )
 
             if additional_quantity > 0:
                 suggested_quantity = (
                     current_quantity
-                    + min(additional_quantity, 10)
+                    + min(
+                        additional_quantity,
+                        10,
+                    )
                 )
+
                 reason_parts.append(
-                    "kuantitas dapat ditambah untuk mendekati target pagu"
+                    "kuantitas dapat ditambah "
+                    "untuk mendekati target pagu"
                 )
 
         if (
-            suggested_unit_price != current_unit_price
-            or suggested_quantity != current_quantity
+            suggested_unit_price
+            != current_unit_price
+            or suggested_quantity
+            != current_quantity
         ):
-            old_total = current_quantity * current_unit_price
+            old_total = (
+                current_quantity
+                * current_unit_price
+            )
+
             new_total = (
                 suggested_quantity
                 * suggested_unit_price
@@ -433,25 +732,42 @@ def recommend_price_and_quantity_changes(
 
             recommendations.append(
                 {
-                    "invoice_item_id": item.get("id"),
-                    "product_id": product_id,
-                    "product_name": item.get(
-                        "raw_description"
+                    "invoice_item_id": (
+                        item.get("id")
                     ),
-                    "old_quantity": current_quantity,
+                    "product_id": (
+                        product_id
+                    ),
+                    "product_name": (
+                        item.get(
+                            "raw_description"
+                        )
+                    ),
+                    "old_quantity": (
+                        current_quantity
+                    ),
                     "suggested_quantity": (
                         suggested_quantity
                     ),
-                    "old_unit_price": current_unit_price,
+                    "old_unit_price": (
+                        current_unit_price
+                    ),
                     "suggested_unit_price": (
                         suggested_unit_price
                     ),
-                    "old_total": old_total,
-                    "suggested_total": new_total,
-                    "estimated_difference": (
-                        new_total - old_total
+                    "old_total": (
+                        old_total
                     ),
-                    "reason": "; ".join(reason_parts),
+                    "suggested_total": (
+                        new_total
+                    ),
+                    "estimated_difference": (
+                        new_total
+                        - old_total
+                    ),
+                    "reason": "; ".join(
+                        reason_parts
+                    ),
                 }
             )
 
@@ -461,6 +777,7 @@ def recommend_price_and_quantity_changes(
 def build_recommendation_summary(
     invoice_id: str,
     limit: int = 10,
+    random_seed: int | None = None,
 ) -> dict[str, Any]:
     """
     Menghasilkan seluruh paket rekomendasi invoice.
@@ -469,9 +786,14 @@ def build_recommendation_summary(
     invoice = get_invoice(invoice_id)
 
     if not invoice:
-        raise ValueError("Invoice tidak ditemukan.")
+        raise ValueError(
+            "Invoice tidak ditemukan."
+        )
 
-    target_budget = _safe_float(invoice.get("target_budget"))
+    target_budget = _safe_float(
+        invoice.get("target_budget")
+    )
+
     current_total = _safe_float(
         invoice.get("final_total")
         or invoice.get("original_total")
@@ -479,12 +801,22 @@ def build_recommendation_summary(
 
     return {
         "invoice": invoice,
-        "target_budget": target_budget,
-        "current_total": current_total,
-        "budget_gap": target_budget - current_total,
-        "new_products": recommend_new_products(
-            invoice_id=invoice_id,
-            limit=limit,
+        "target_budget": (
+            target_budget
+        ),
+        "current_total": (
+            current_total
+        ),
+        "budget_gap": (
+            target_budget
+            - current_total
+        ),
+        "new_products": (
+            recommend_new_products(
+                invoice_id=invoice_id,
+                limit=limit,
+                random_seed=random_seed,
+            )
         ),
         "adjustments": (
             recommend_price_and_quantity_changes(
