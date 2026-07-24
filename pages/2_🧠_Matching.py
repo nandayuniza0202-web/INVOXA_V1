@@ -7,6 +7,7 @@ import streamlit as st
 
 from database.supabase_client import supabase
 from utils.common import (
+    CATEGORIES,
     UNITS,
     prepare_dataframe,
     recalculate,
@@ -25,16 +26,6 @@ st.set_page_config(
 )
 
 
-# =========================================================
-# KONSTANTA
-# =========================================================
-
-CATEGORIES = [
-    "Belum Dikategorikan",
-    "APD",
-    "Alat Kebersihan",
-    "Alat Kelengkapan",
-]
 
 
 # =========================================================
