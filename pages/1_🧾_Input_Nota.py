@@ -1312,7 +1312,7 @@ if method == "📊 Excel / CSV":
                                 ".xlsm",
                             )
                         )
-                        else "csv"
+                        else "import"
                     )
 
                     st.rerun()
@@ -1335,7 +1335,7 @@ if method == "📊 Excel / CSV":
                                 ".xlsm",
                             )
                         )
-                        else "csv"
+                        else "import"
                     )
 
                     st.rerun()

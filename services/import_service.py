@@ -89,8 +89,8 @@ def import_tabular_file(
         input_method = "excel"
 
     elif extension in CSV_EXTENSIONS:
-        dataframe = parse_csv_file(source)
-        input_method = "csv"
+    dataframe = parse_csv_file(source)
+    input_method = "import"
 
     else:
         raise ValueError(
