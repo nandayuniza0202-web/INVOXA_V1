@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -23,28 +23,19 @@ def get_file_extension(
     source: str | Path | BinaryIO,
     filename: str | None = None,
 ) -> str:
-    """
-    Mengambil ekstensi file dari path lokal
-    atau nama file hasil upload Streamlit.
-    """
-
     if filename:
         return Path(filename).suffix.lower()
 
     if isinstance(source, (str, Path)):
         return Path(source).suffix.lower()
 
-    source_name = getattr(source, "name", "")
-
-    return Path(source_name).suffix.lower()
+    return Path(getattr(source, "name", "")).suffix.lower()
 
 
 def get_source_filename(
     source: str | Path | BinaryIO,
     filename: str | None = None,
 ) -> str:
-    """Mengambil nama file sumber."""
-
     if filename:
         return Path(filename).name
 
@@ -52,50 +43,26 @@ def get_source_filename(
         return Path(source).name
 
     source_name = getattr(source, "name", "")
-
-    if source_name:
-        return Path(source_name).name
-
-    return "uploaded_file"
+    return Path(source_name).name if source_name else "uploaded_file"
 
 
 def import_tabular_file(
     source: str | Path | BinaryIO,
     filename: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Membaca Excel atau CSV ke format standar INVOXA.
-
-    Proses:
-    1. Mendeteksi jenis file.
-    2. Memilih parser Excel atau CSV.
-    3. Menyamakan struktur kolom.
-    4. Memprediksi ulang kategori seluruh barang.
-    5. Menambahkan informasi sumber file.
-    """
-
-    extension = get_file_extension(
-        source=source,
-        filename=filename,
-    )
-
-    source_filename = get_source_filename(
-        source=source,
-        filename=filename,
-    )
+    extension = get_file_extension(source=source, filename=filename)
+    source_filename = get_source_filename(source=source, filename=filename)
 
     if extension in EXCEL_EXTENSIONS:
         dataframe = parse_and_combine_excel(source)
         input_method = "excel"
-
     elif extension in CSV_EXTENSIONS:
         dataframe = parse_csv_file(source)
         input_method = "import"
-
     else:
         raise ValueError(
-            f"Format file {extension or 'tidak diketahui'} "
-            "belum didukung. Gunakan file Excel atau CSV."
+            f"Format file {extension or 'tidak diketahui'} belum didukung. "
+            "Gunakan file Excel atau CSV."
         )
 
     if dataframe is None:
@@ -104,18 +71,12 @@ def import_tabular_file(
     if dataframe.empty:
         dataframe["source_filename"] = pd.Series(dtype="object")
         dataframe["input_method"] = pd.Series(dtype="object")
-
         return dataframe
 
-    # Kategori dari file lama diprediksi ulang.
-    # Contoh:
-    # kertas dan amplop menjadi ATK,
-    # penutup kepala menjadi APD.
     dataframe = apply_predicted_categories(
         dataframe,
         overwrite_existing=True,
     )
-
     dataframe["source_filename"] = source_filename
     dataframe["input_method"] = input_method
 
@@ -123,8 +84,6 @@ def import_tabular_file(
 
 
 def _is_empty_value(value: Any) -> bool:
-    """Memeriksa apakah nilai kosong, None, NaN, atau hanya spasi."""
-
     if value is None:
         return True
 
@@ -137,54 +96,32 @@ def _is_empty_value(value: Any) -> bool:
     return not str(value).strip()
 
 
-def _safe_number(
-    value: Any,
-    default: float = 0,
-) -> float:
-    """
-    Mengubah nilai kosong atau tidak valid menjadi angka aman.
-
-    Mendukung format:
-    - 1250000
-    - 1.250.000
-    - Rp1.250.000
-    - 1.250.000,50
-    """
-
+def _safe_number(value: Any, default: float = 0) -> float:
     if _is_empty_value(value):
         return default
 
     if isinstance(value, str):
-        cleaned_value = value.strip()
-
-        cleaned_value = (
-            cleaned_value
+        cleaned = (
+            value.strip()
             .replace("Rp", "")
             .replace("rp", "")
             .replace(" ", "")
         )
 
-        if "." in cleaned_value and "," in cleaned_value:
-            cleaned_value = (
-                cleaned_value
-                .replace(".", "")
-                .replace(",", ".")
-            )
-
-        elif "," in cleaned_value:
-            cleaned_value = cleaned_value.replace(",", ".")
-
-        elif "." in cleaned_value:
-            parts = cleaned_value.split(".")
-
+        if "." in cleaned and "," in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif "," in cleaned:
+            cleaned = cleaned.replace(",", ".")
+        elif "." in cleaned:
+            parts = cleaned.split(".")
             if (
                 len(parts) > 1
                 and all(part.isdigit() for part in parts)
                 and len(parts[-1]) == 3
             ):
-                cleaned_value = "".join(parts)
+                cleaned = "".join(parts)
 
-        value = cleaned_value
+        value = cleaned
 
     try:
         return float(value)
@@ -192,81 +129,61 @@ def _safe_number(
         return default
 
 
-def _safe_text(
-    value: Any,
-    default: str = "",
-) -> str:
-    """Mengubah nilai menjadi teks yang aman."""
-
+def _safe_text(value: Any, default: str = "") -> str:
     if _is_empty_value(value):
         return default
-
     return str(value).strip()
 
 
+def _normalize_invoice_date(value: date | str | None) -> str:
+    if value is None:
+        return date.today().isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    text = str(value).strip()
+
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    raise ValueError(
+        "Format tanggal invoice tidak dikenali. "
+        "Gunakan YYYY-MM-DD atau DD/MM/YYYY."
+    )
+
+
 def _get_row_description(row: pd.Series) -> str:
-    """
-    Mengambil uraian barang dari beberapa kemungkinan nama kolom.
-
-    Prioritas:
-    1. raw_description
-    2. description
-    3. product_name
-    4. name
-    5. item_name
-    """
-
-    description_columns = [
+    for column_name in (
         "raw_description",
         "description",
         "product_name",
         "name",
         "item_name",
-    ]
-
-    for column_name in description_columns:
+    ):
         value = row.get(column_name)
-
         if not _is_empty_value(value):
             return str(value).strip()
-
     return ""
 
 
-def _get_row_category(
-    row: pd.Series,
-) -> dict[str, Any]:
-    """
-    Menentukan kategori final untuk satu baris barang.
-
-    Prioritas:
-    1. Kategori yang sudah ada pada tabel koreksi.
-    2. Prediksi otomatis dari uraian barang.
-    3. Belum Dikategorikan.
-    """
-
+def _get_row_category(row: pd.Series) -> dict[str, Any]:
     description = _get_row_description(row)
-
-    category_name = _safe_text(
-        row.get("category")
-    )
-
-    category_source = _safe_text(
-        row.get("category_source")
-    )
-
+    category_name = _safe_text(row.get("category"))
+    category_source = _safe_text(row.get("category_source"))
     category_confidence = _safe_number(
         row.get("category_confidence"),
         default=0,
     )
-
     matched_keyword = _safe_text(
         row.get("category_matched_keyword")
     )
 
     if category_name:
         category = get_category_by_name(category_name)
-
         if category:
             if not category_source:
                 category_source = "manual"
@@ -288,19 +205,14 @@ def _get_row_category(
             "category_name": prediction["category_name"],
             "category_source": prediction["source"],
             "category_confidence": prediction["confidence"],
-            "matched_keyword": (
-                prediction.get("matched_keyword") or ""
-            ),
+            "matched_keyword": prediction.get("matched_keyword") or "",
         }
 
-    uncategorized = get_category_by_name(
-        "Belum Dikategorikan"
-    )
+    uncategorized = get_category_by_name("Belum Dikategorikan")
 
     if not uncategorized:
         raise RuntimeError(
-            "Kategori 'Belum Dikategorikan' "
-            "tidak ditemukan di Supabase."
+            "Kategori 'Belum Dikategorikan' tidak ditemukan di Supabase."
         )
 
     return {
@@ -317,20 +229,10 @@ def _get_or_create_product(
     category_name: str,
     unit: str | None,
 ) -> dict[str, Any]:
-    """
-    Mengambil produk berdasarkan normalized_name.
-
-    Jika produk belum ada, produk baru dibuat.
-    Jika produk sudah ada tetapi kategorinya berubah,
-    kategori produk akan diperbarui.
-    """
-
     normalized_name = normalize_text(description)
 
     if not normalized_name:
-        raise ValueError(
-            "Nama produk tidak boleh kosong."
-        )
+        raise ValueError("Nama produk tidak boleh kosong.")
 
     existing_response = (
         supabase.table("products")
@@ -340,30 +242,25 @@ def _get_or_create_product(
         .execute()
     )
 
-    category = get_category_by_name(category_name)
+    category = (
+        get_category_by_name(category_name)
+        or get_category_by_name("Belum Dikategorikan")
+    )
 
     if not category:
-        category = get_category_by_name(
-            "Belum Dikategorikan"
-        )
-
-    if not category:
-        raise RuntimeError(
-            "Kategori produk tidak ditemukan di Supabase."
-        )
+        raise RuntimeError("Kategori produk tidak ditemukan di Supabase.")
 
     if existing_response.data:
         existing_product = existing_response.data[0]
-
         update_payload: dict[str, Any] = {}
 
-        if existing_product.get("category_id") != category["id"]:
+        # Jangan mengganti kategori master yang sudah valid hanya karena
+        # satu hasil prediksi impor berbeda.
+        existing_category_id = existing_product.get("category_id")
+        if not existing_category_id:
             update_payload["category_id"] = category["id"]
 
-        if (
-            not existing_product.get("default_unit")
-            and unit
-        ):
+        if not existing_product.get("default_unit") and unit:
             update_payload["default_unit"] = unit
 
         if update_payload:
@@ -373,10 +270,8 @@ def _get_or_create_product(
                 .eq("id", existing_product["id"])
                 .execute()
             )
-
             if updated_response.data:
                 return updated_response.data[0]
-
             existing_product.update(update_payload)
 
         return existing_product
@@ -396,11 +291,33 @@ def _get_or_create_product(
     )
 
     if not created_response.data:
-        raise RuntimeError(
-            f"Produk gagal dibuat: {description}"
-        )
+        raise RuntimeError(f"Produk gagal dibuat: {description}")
 
     return created_response.data[0]
+
+
+def _cleanup_failed_invoice(invoice_id: str) -> None:
+    """Rollback best-effort bila penyimpanan invoice gagal di tengah proses."""
+    try:
+        supabase.table("price_history").delete().eq(
+            "invoice_id", invoice_id
+        ).execute()
+    except Exception:
+        pass
+
+    try:
+        supabase.table("invoice_items").delete().eq(
+            "invoice_id", invoice_id
+        ).execute()
+    except Exception:
+        pass
+
+    try:
+        supabase.table("invoices").delete().eq(
+            "id", invoice_id
+        ).execute()
+    except Exception:
+        pass
 
 
 def save_imported_invoice(
@@ -412,17 +329,8 @@ def save_imported_invoice(
     target_budget: float | None = None,
     notes: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Menyimpan hasil tabel koreksi ke Supabase.
-
-    Kategori yang sudah dikoreksi manual tidak akan ditimpa.
-    Barang yang kategorinya masih kosong akan diprediksi otomatis.
-    """
-
     if dataframe is None or dataframe.empty:
-        raise ValueError(
-            "Tidak ada data yang dapat disimpan."
-        )
+        raise ValueError("Tidak ada data yang dapat disimpan.")
 
     required_columns = {
         "raw_description",
@@ -432,9 +340,7 @@ def save_imported_invoice(
         "total_price",
     }
 
-    missing_columns = (
-        required_columns - set(dataframe.columns)
-    )
+    missing_columns = required_columns - set(dataframe.columns)
 
     if missing_columns:
         raise ValueError(
@@ -442,11 +348,8 @@ def save_imported_invoice(
             + ", ".join(sorted(missing_columns))
         )
 
-    clean_dataframe = dataframe.copy()
-
-    # Jangan menimpa hasil koreksi manual pengguna.
     clean_dataframe = apply_predicted_categories(
-        clean_dataframe,
+        dataframe.copy(),
         overwrite_existing=False,
     )
 
@@ -462,71 +365,54 @@ def save_imported_invoice(
     ].copy()
 
     if clean_dataframe.empty:
-        raise ValueError(
-            "Semua uraian barang kosong."
-        )
+        raise ValueError("Semua uraian barang kosong.")
 
+    # Selalu hitung ulang total agar tidak bergantung pada total_price yang salah.
+    clean_dataframe["_safe_quantity"] = clean_dataframe["quantity"].apply(
+        lambda value: max(_safe_number(value, 1), 1)
+    )
+    clean_dataframe["_safe_unit_price"] = clean_dataframe["unit_price"].apply(
+        lambda value: max(_safe_number(value, 0), 0)
+    )
     original_total = float(
-        clean_dataframe["total_price"]
-        .apply(
-            lambda value: _safe_number(
-                value,
-                default=0,
-            )
-        )
-        .sum()
+        (
+            clean_dataframe["_safe_quantity"]
+            * clean_dataframe["_safe_unit_price"]
+        ).sum()
     )
 
     source_filename: str | None = None
     input_method = "manual"
 
     if "source_filename" in clean_dataframe.columns:
-        source_values = (
+        values = (
             clean_dataframe["source_filename"]
             .dropna()
             .astype(str)
             .str.strip()
         )
-
-        source_values = source_values[
-            source_values.ne("")
-        ]
-
-        if not source_values.empty:
-            source_filename = source_values.iloc[0]
+        values = values[values.ne("")]
+        if not values.empty:
+            source_filename = values.iloc[0]
 
     if "input_method" in clean_dataframe.columns:
-        input_method_values = (
+        values = (
             clean_dataframe["input_method"]
             .dropna()
             .astype(str)
             .str.strip()
         )
+        values = values[values.ne("")]
+        if not values.empty:
+            input_method = values.iloc[0]
 
-        input_method_values = input_method_values[
-            input_method_values.ne("")
-        ]
-
-        if not input_method_values.empty:
-            input_method = input_method_values.iloc[0]
-
-    saved_invoice_date = (
-        str(invoice_date)
-        if invoice_date
-        else str(date.today())
-    )
+    saved_invoice_date = _normalize_invoice_date(invoice_date)
 
     invoice_payload = {
-        "invoice_number": (
-            _safe_text(invoice_number) or None
-        ),
+        "invoice_number": _safe_text(invoice_number) or None,
         "invoice_date": saved_invoice_date,
-        "vendor_name": (
-            _safe_text(vendor_name) or None
-        ),
-        "customer_name": (
-            _safe_text(customer_name) or None
-        ),
+        "vendor_name": _safe_text(vendor_name) or None,
+        "customer_name": _safe_text(customer_name) or None,
         "target_budget": (
             _safe_number(target_budget)
             if target_budget is not None
@@ -547,122 +433,88 @@ def save_imported_invoice(
     )
 
     if not invoice_response.data:
-        raise RuntimeError(
-            "Invoice gagal dibuat di Supabase."
-        )
+        raise RuntimeError("Invoice gagal dibuat di Supabase.")
 
     invoice = invoice_response.data[0]
     invoice_id = invoice["id"]
-
     saved_items = 0
 
-    for _, row in clean_dataframe.iterrows():
-        description = _get_row_description(row)
+    try:
+        for _, row in clean_dataframe.iterrows():
+            description = _get_row_description(row)
+            if not description:
+                continue
 
-        if not description:
-            continue
+            unit = _safe_text(row.get("unit")) or None
+            quantity = max(_safe_number(row.get("quantity"), 1), 1)
+            unit_price = max(_safe_number(row.get("unit_price"), 0), 0)
+            category_data = _get_row_category(row)
 
-        unit_text = _safe_text(
-            row.get("unit")
-        )
-        unit = unit_text or None
-
-        quantity = _safe_number(
-            row.get("quantity"),
-            default=1,
-        )
-
-        if quantity <= 0:
-            quantity = 1
-
-        unit_price = _safe_number(
-            row.get("unit_price"),
-            default=0,
-        )
-
-        category_data = _get_row_category(row)
-
-        product = _get_or_create_product(
-            description=description,
-            category_name=category_data[
-                "category_name"
-            ],
-            unit=unit,
-        )
-
-        item_payload = {
-            "invoice_id": invoice_id,
-            "product_id": product["id"],
-            "raw_description": description,
-            "normalized_description": normalize_text(
-                description
-            ),
-            "category_id": category_data[
-                "category_id"
-            ],
-            "quantity": quantity,
-            "unit": unit,
-            "unit_price": unit_price,
-            "category_source": category_data[
-                "category_source"
-            ],
-            "category_confidence": category_data[
-                "category_confidence"
-            ],
-            "is_recommended": False,
-        }
-
-        item_response = (
-            supabase.table("invoice_items")
-            .insert(item_payload)
-            .execute()
-        )
-
-        if not item_response.data:
-            raise RuntimeError(
-                f"Item gagal disimpan: {description}"
+            product = _get_or_create_product(
+                description=description,
+                category_name=category_data["category_name"],
+                unit=unit,
             )
 
-        invoice_item = item_response.data[0]
+            item_payload = {
+                "invoice_id": invoice_id,
+                "product_id": product["id"],
+                "raw_description": description,
+                "normalized_description": normalize_text(description),
+                "category_id": category_data["category_id"],
+                "quantity": quantity,
+                "unit": unit,
+                "unit_price": unit_price,
+                "category_source": category_data["category_source"],
+                "category_confidence": category_data["category_confidence"],
+                "is_recommended": False,
+            }
 
-        price_payload = {
-            "product_id": product["id"],
-            "invoice_item_id": invoice_item["id"],
-            "vendor_name": (
-                _safe_text(vendor_name) or None
-            ),
-            "unit": unit,
-            "quantity": quantity,
-            "unit_price": unit_price,
-            "recorded_date": saved_invoice_date,
-        }
-
-        price_response = (
-            supabase.table("price_history")
-            .insert(price_payload)
-            .execute()
-        )
-
-        if not price_response.data:
-            raise RuntimeError(
-                "Riwayat harga gagal disimpan untuk "
-                f"{description}."
+            item_response = (
+                supabase.table("invoice_items")
+                .insert(item_payload)
+                .execute()
             )
 
-        current_usage_count = int(
-            product.get("usage_count") or 0
-        )
+            if not item_response.data:
+                raise RuntimeError(f"Item gagal disimpan: {description}")
 
-        (
-            supabase.table("products")
-            .update({
-                "usage_count": current_usage_count + 1,
-            })
-            .eq("id", product["id"])
-            .execute()
-        )
+            invoice_item = item_response.data[0]
 
-        saved_items += 1
+            price_payload = {
+                "product_id": product["id"],
+                "invoice_item_id": invoice_item["id"],
+                "vendor_name": _safe_text(vendor_name) or None,
+                "unit": unit,
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "recorded_date": saved_invoice_date,
+            }
+
+            price_response = (
+                supabase.table("price_history")
+                .insert(price_payload)
+                .execute()
+            )
+
+            if not price_response.data:
+                raise RuntimeError(
+                    f"Riwayat harga gagal disimpan untuk {description}."
+                )
+
+            current_usage_count = int(product.get("usage_count") or 0)
+            (
+                supabase.table("products")
+                .update({"usage_count": current_usage_count + 1})
+                .eq("id", product["id"])
+                .execute()
+            )
+
+            saved_items += 1
+
+    except Exception:
+        _cleanup_failed_invoice(invoice_id)
+        raise
 
     return {
         "invoice_id": invoice_id,

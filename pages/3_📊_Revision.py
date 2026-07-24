@@ -6,7 +6,11 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from services.recommendation_service import recommend_new_products
+from services.recommendation_service import (
+    get_product_family,
+    get_recommendation_quantity_limit,
+    recommend_new_products,
+)
 from utils.common import CATEGORIES, UNITS, prepare_dataframe, recalculate, rupiah
 
 
@@ -84,6 +88,80 @@ def get_current_invoice_id() -> str | None:
         return str(metadata["invoice_id"])
 
     return None
+
+
+def apply_absolute_quantity_rules(
+    dataframe: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Menerapkan batas absolut untuk barang dengan aturan khusus.
+
+    Aturan ini berlaku juga pada barang hasil impor/manual:
+    - masker hijab maksimal 10;
+    - masker non-hijab maksimal 10.
+
+    Barang lain tetap mengikuti aturan sumber masing-masing.
+    """
+
+    result = dataframe.copy()
+    messages: list[str] = []
+
+    if "Uraian" not in result.columns:
+        return result, messages
+
+    quantity_column = (
+        "Kuantitas Usulan"
+        if "Kuantitas Usulan" in result.columns
+        else "Kuantitas"
+    )
+
+    changed_items = 0
+
+    for idx in result.index:
+        description = str(result.at[idx, "Uraian"] or "")
+        family = get_product_family(description)
+
+        if family not in {"masker_hijab", "masker_non_hijab"}:
+            continue
+
+        current_quantity = safe_float(
+            result.at[idx, quantity_column]
+        )
+        maximum_quantity = float(
+            get_recommendation_quantity_limit(description)
+        )
+
+        if current_quantity <= maximum_quantity:
+            continue
+
+        result.at[idx, quantity_column] = maximum_quantity
+
+        if "Kuantitas" in result.columns:
+            result.at[idx, "Kuantitas"] = maximum_quantity
+
+        if (
+            "Jumlah Usulan" in result.columns
+            and "Harga Usulan" in result.columns
+        ):
+            result.at[idx, "Jumlah Usulan"] = (
+                maximum_quantity
+                * safe_float(result.at[idx, "Harga Usulan"])
+            )
+
+        if "Jumlah" in result.columns and "Harga" in result.columns:
+            result.at[idx, "Jumlah"] = (
+                maximum_quantity
+                * safe_float(result.at[idx, "Harga"])
+            )
+
+        changed_items += 1
+
+    if changed_items:
+        messages.append(
+            f"{changed_items} item masker dibatasi maksimal 10."
+        )
+
+    return result, messages
 
 
 def prepare_simulation_source(source: pd.DataFrame) -> pd.DataFrame:
@@ -166,6 +244,8 @@ def recommendation_rows(
                 "Product ID": item.get("product_id"),
                 "Skor Rekomendasi": safe_float(item.get("score")),
                 "Alasan": str(item.get("reason") or ""),
+                "Batas Rekomendasi": int(item.get("quantity_limit") or 10),
+                "Wajib APD": bool(item.get("is_mandatory")),
             }
         )
 
@@ -212,10 +292,12 @@ def add_database_products(
 
     candidates = candidates.sort_values(
         by=[
+            "Wajib APD",
             "Skor Rekomendasi",
             "Jumlah Usulan",
         ],
         ascending=[
+            False,
             False,
             True,
         ],
@@ -241,12 +323,17 @@ def add_database_products(
         if remaining <= 0:
             break
 
+        quantity_limit = max(
+            int(safe_float(candidate.get("Batas Rekomendasi"), 10)),
+            1,
+        )
+
         suggested_quantity = max(
             1,
             min(
                 int(math.floor(remaining / unit_price)),
                 int(max(safe_float(candidate["Kuantitas Usulan"]), 1)),
-                10,
+                quantity_limit,
             ),
         )
 
@@ -344,17 +431,43 @@ def increase_quantities(
             continue
 
         baseline_qty = max(original_qty, current_qty, 1.0)
-
-        max_qty = max(
-            current_qty,
-            math.floor(
-                baseline_qty
-                * (
-                    1.0
-                    + max_quantity_increase / 100.0
-                )
-            ),
+        product_family = get_product_family(
+            str(result.at[idx, "Uraian"] or "")
         )
+
+        if product_family in {
+            "masker_hijab",
+            "masker_non_hijab",
+        }:
+            # Batas masker bersifat absolut, termasuk barang impor/manual.
+            max_qty = float(
+                get_recommendation_quantity_limit(
+                    str(result.at[idx, "Uraian"] or "")
+                )
+            )
+
+        elif str(result.at[idx, "Sumber"]) == "Barang Baru Database":
+            recommendation_limit = int(
+                safe_float(
+                    result.at[idx, "Batas Rekomendasi"]
+                    if "Batas Rekomendasi" in result.columns
+                    else 10,
+                    10,
+                )
+            )
+            max_qty = max(current_qty, recommendation_limit)
+
+        else:
+            max_qty = max(
+                current_qty,
+                math.floor(
+                    baseline_qty
+                    * (
+                        1.0
+                        + max_quantity_increase / 100.0
+                    )
+                ),
+            )
 
         possible_addition = int(
             max_qty - current_qty
@@ -570,13 +683,38 @@ def precise_balance(
             1.0,
         )
 
-        max_qty = math.floor(
-            baseline_qty
-            * (
-                1.0
-                + max_quantity_increase / 100.0
-            )
+        product_family = get_product_family(
+            str(result.at[idx, "Uraian"] or "")
         )
+
+        if product_family in {
+            "masker_hijab",
+            "masker_non_hijab",
+        }:
+            max_qty = int(
+                get_recommendation_quantity_limit(
+                    str(result.at[idx, "Uraian"] or "")
+                )
+            )
+
+        elif str(result.at[idx, "Sumber"]) == "Barang Baru Database":
+            max_qty = int(
+                safe_float(
+                    result.at[idx, "Batas Rekomendasi"]
+                    if "Batas Rekomendasi" in result.columns
+                    else 10,
+                    10,
+                )
+            )
+
+        else:
+            max_qty = math.floor(
+                baseline_qty
+                * (
+                    1.0
+                    + max_quantity_increase / 100.0
+                )
+            )
 
         if qty + 1 <= max_qty:
             candidate_total = current_total + price
@@ -702,6 +840,11 @@ def build_automatic_database_simulation(
     """
 
     result = prepare_simulation_source(source)
+
+    result, absolute_rule_messages = apply_absolute_quantity_rules(
+        result
+    )
+
     original_total = float(
         result["Jumlah Asli"].sum()
     )
@@ -709,6 +852,7 @@ def build_automatic_database_simulation(
     target = float(round(target))
 
     messages: list[str] = []
+    messages.extend(absolute_rule_messages)
 
     try:
         recommendations = recommend_new_products(
@@ -750,6 +894,14 @@ def build_automatic_database_simulation(
         rounding_step=rounding_step,
     )
     messages.extend(price_messages)
+
+    # Safety pass: enforce absolute rules before the final tolerance check.
+    # If a prior operation changed a protected item, the balancing loop below
+    # works from the corrected total instead of showing a false Rp206 result.
+    result, final_rule_messages = apply_absolute_quantity_rules(
+        result
+    )
+    messages.extend(final_rule_messages)
 
     for _ in range(100):
         current_total = float(
@@ -1254,6 +1406,18 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
         ):
             st.caption(f"• {message}")
 
+        mandatory_count = int(
+            simulation_df.get("Wajib APD", pd.Series(dtype=bool))
+            .fillna(False)
+            .astype(bool)
+            .sum()
+        )
+        if mandatory_count:
+            st.info(
+                f"{mandatory_count} rekomendasi diprioritaskan untuk "
+                "memenuhi aturan minimum APD."
+            )
+
         if st.button(
             "🔄 Refresh dengan Barang Berbeda",
             use_container_width=True,
@@ -1465,10 +1629,10 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
             if column not in simulation_df.columns:
                 simulation_df[column] = None
 
+        editor_columns = DISPLAY_COLUMNS.copy()
+
         edited_simulation = st.data_editor(
-            simulation_df[
-                DISPLAY_COLUMNS
-            ],
+            simulation_df[editor_columns],
             hide_index=True,
             use_container_width=True,
             num_rows="dynamic",
@@ -1578,6 +1742,14 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
             errors="coerce",
         ).fillna(0.0)
 
+        # Validasi ulang hanya untuk perubahan manual pengguna.
+        # Simulasi otomatis V3 sudah menerapkan batas sebelum balancing.
+        edited_simulation, editor_rule_messages = (
+            apply_absolute_quantity_rules(
+                edited_simulation
+            )
+        )
+
         edited_simulation[
             "Jumlah Usulan"
         ] = (
@@ -1588,6 +1760,9 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
                 "Harga Usulan"
             ]
         )
+
+        for rule_message in editor_rule_messages:
+            st.caption(f"• {rule_message}")
 
         preview_total = float(
             edited_simulation[
@@ -1795,6 +1970,15 @@ else:
     edited_category = recalculate(
         edited_category
     )
+
+    edited_category, manual_rule_messages = (
+        apply_absolute_quantity_rules(
+            edited_category
+        )
+    )
+
+    for rule_message in manual_rule_messages:
+        st.caption(f"• {rule_message}")
 
     edited_category = edited_category[
         edited_category[
