@@ -1357,7 +1357,7 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
         max_price_increase = st.slider(
             "Maksimal kenaikan harga per barang",
             min_value=0,
-            max_value=30,
+            max_value=100,
             value=int(
                 DEFAULT_MAX_PRICE_INCREASE
             ),
