@@ -629,6 +629,211 @@ def recommend_new_products(
     )
 
 
+def recommend_replacement_product(
+    invoice_id: str,
+    replaced_product_id: str,
+    visible_product_ids: set[str] | None,
+    old_product_name: str,
+    old_category: str,
+    old_total: float,
+    random_seed: int | None = None,
+) -> dict[str, Any] | None:
+    """
+    Mencari satu produk pengganti untuk satu baris rekomendasi.
+
+    Ketentuan:
+    - produk yang sudah ada pada invoice tidak boleh dipilih;
+    - produk rekomendasi lain yang sedang tampil tidak boleh dipilih;
+    - produk yang diganti juga dikecualikan;
+    - family APD wajib harus tetap sama;
+    - barang biasa memprioritaskan kategori yang sama;
+    - nilai total kandidat dipilih sedekat mungkin dengan nilai barang lama.
+    """
+
+    invoice = get_invoice(invoice_id)
+
+    if not invoice:
+        raise ValueError("Invoice tidak ditemukan.")
+
+    invoice_items = get_invoice_items(invoice_id)
+    products = get_products_with_history()
+
+    excluded_ids = get_existing_product_ids(invoice_items)
+    excluded_ids.update(
+        str(product_id)
+        for product_id in (visible_product_ids or set())
+        if product_id
+    )
+
+    if replaced_product_id:
+        excluded_ids.add(str(replaced_product_id))
+
+    old_family = get_product_family(old_product_name)
+    protected_families = {
+        "masker_hijab",
+        "masker_non_hijab",
+        "sarung_tangan_medis",
+    }
+
+    normalized_old_category = str(old_category or "").strip().lower()
+    target_total = max(_safe_float(old_total), 0.0)
+    generator = random.Random(random_seed)
+
+    candidates: list[dict[str, Any]] = []
+
+    for product in products:
+        product_id = str(product.get("id") or "")
+
+        if not product_id or product_id in excluded_ids:
+            continue
+
+        product_name = (
+            product.get("product_name")
+            or product.get("normalized_name")
+            or ""
+        )
+
+        if not product_name:
+            continue
+
+        family = get_product_family(product_name)
+        category_name = (
+            get_category_name(product)
+            or "Belum Dikategorikan"
+        )
+
+        # APD wajib hanya boleh diganti dengan family yang sama.
+        if old_family in protected_families:
+            if family != old_family:
+                continue
+        else:
+            # Barang biasa jangan mengambil family APD wajib.
+            if family in protected_families:
+                continue
+
+        price_stats = calculate_price_statistics(
+            product.get("price_history")
+        )
+
+        reference_price = (
+            get_special_reference_price(product_name)
+            or price_stats["latest_price"]
+            or price_stats["average_price"]
+        )
+
+        if reference_price <= 0:
+            continue
+
+        quantity_limit = get_recommendation_quantity_limit(
+            product_name
+        )
+
+        if old_family in protected_families:
+            if old_family == "sarung_tangan_medis":
+                suggested_quantity = MEDICAL_GLOVE_REQUIRED
+            else:
+                suggested_quantity = 10
+        elif target_total > 0:
+            suggested_quantity = max(
+                1,
+                min(
+                    int(round(target_total / reference_price)),
+                    quantity_limit,
+                ),
+            )
+        else:
+            suggested_quantity = 1
+
+        estimated_total = (
+            suggested_quantity * reference_price
+        )
+
+        same_category = (
+            str(category_name).strip().lower()
+            == normalized_old_category
+        )
+
+        # Prioritas utama: family wajib, kategori sama, lalu total terdekat.
+        category_penalty = 0.0 if same_category else max(
+            target_total * 0.20,
+            50_000.0,
+        )
+
+        distance = abs(estimated_total - target_total)
+        random_tiebreaker = generator.uniform(0.0, 1.0)
+
+        candidates.append(
+            {
+                "product_id": product_id,
+                "product_name": product_name,
+                "product_family": family,
+                "category": category_name,
+                "unit": product.get("default_unit") or "pcs",
+                "suggested_quantity": float(suggested_quantity),
+                "quantity_limit": int(quantity_limit),
+                "suggested_unit_price": float(reference_price),
+                "estimated_total": float(estimated_total),
+                "average_price": float(
+                    price_stats["average_price"]
+                ),
+                "minimum_price": float(
+                    price_stats["minimum_price"]
+                ),
+                "maximum_price": float(
+                    price_stats["maximum_price"]
+                ),
+                "latest_price": float(
+                    price_stats["latest_price"]
+                ),
+                "usage_count": int(
+                    product.get("usage_count") or 0
+                ),
+                "score": float(
+                    int(product.get("usage_count") or 0)
+                ),
+                "priority": (
+                    100
+                    if old_family in protected_families
+                    else 0
+                ),
+                "is_mandatory": (
+                    old_family in protected_families
+                ),
+                "reason": (
+                    "Pengganti satu item; "
+                    + (
+                        "family wajib dipertahankan; "
+                        if old_family in protected_families
+                        else ""
+                    )
+                    + (
+                        "kategori sama; "
+                        if same_category
+                        else ""
+                    )
+                    + "nilai dipilih mendekati barang lama"
+                ),
+                "_selection_key": (
+                    category_penalty + distance,
+                    -int(product.get("usage_count") or 0),
+                    random_tiebreaker,
+                ),
+            }
+        )
+
+    if not candidates:
+        return None
+
+    selected = min(
+        candidates,
+        key=lambda item: item["_selection_key"],
+    ).copy()
+
+    selected.pop("_selection_key", None)
+
+    return selected
+
+
 def recommend_price_and_quantity_changes(
     invoice_id: str,
 ) -> list[dict[str, Any]]:

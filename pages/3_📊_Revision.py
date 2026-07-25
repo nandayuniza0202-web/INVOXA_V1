@@ -10,6 +10,7 @@ from services.recommendation_service import (
     get_product_family,
     get_recommendation_quantity_limit,
     recommend_new_products,
+    recommend_replacement_product,
 )
 from utils.common import CATEGORIES, UNITS, prepare_dataframe, recalculate, rupiah
 
@@ -242,6 +243,12 @@ def recommendation_rows(
                 "Jumlah Usulan": quantity * price,
                 "Sumber": "Barang Baru Database",
                 "Product ID": item.get("product_id"),
+                "Product Family": str(
+                    item.get("product_family")
+                    or get_product_family(
+                        item.get("product_name") or ""
+                    )
+                ),
                 "Skor Rekomendasi": safe_float(item.get("score")),
                 "Alasan": str(item.get("reason") or ""),
                 "Batas Rekomendasi": int(item.get("quantity_limit") or 10),
@@ -818,6 +825,194 @@ def precise_balance(
     )
 
 
+def replace_single_recommendation_row(
+    simulation_df: pd.DataFrame,
+    row_index: int,
+    replacement: dict[str, Any],
+    target: float,
+    max_price_increase: float,
+    max_quantity_increase: float,
+    rounding_step: int,
+    tolerance: float,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Mengganti satu baris rekomendasi dan menyeimbangkan kembali total.
+    """
+
+    result = simulation_df.copy()
+    messages: list[str] = []
+
+    if row_index not in result.index:
+        raise ValueError("Baris rekomendasi tidak ditemukan.")
+
+    old_name = str(result.at[row_index, "Uraian"])
+    old_total = safe_float(
+        result.at[row_index, "Jumlah Usulan"]
+    )
+
+    price = safe_float(
+        replacement.get("suggested_unit_price")
+        or replacement.get("average_price")
+    )
+
+    if price <= 0:
+        raise ValueError(
+            "Harga barang pengganti tidak valid."
+        )
+
+    quantity_limit = max(
+        int(replacement.get("quantity_limit") or 10),
+        1,
+    )
+
+    quantity = max(
+        1,
+        min(
+            int(
+                replacement.get("suggested_quantity")
+                or round(old_total / price)
+                or 1
+            ),
+            quantity_limit,
+        ),
+    )
+
+    result.at[row_index, "Uraian"] = str(
+        replacement.get("product_name")
+        or "Barang Database"
+    )
+    result.at[row_index, "Kategori"] = str(
+        replacement.get("category")
+        or "Belum Dikategorikan"
+    )
+    result.at[row_index, "Satuan"] = str(
+        replacement.get("unit") or "pcs"
+    )
+    result.at[row_index, "Kuantitas"] = float(quantity)
+    result.at[row_index, "Kuantitas Asli"] = 0.0
+    result.at[row_index, "Kuantitas Usulan"] = float(quantity)
+    result.at[row_index, "Harga"] = float(price)
+    result.at[row_index, "Harga Asli"] = float(price)
+    result.at[row_index, "Harga Usulan"] = float(price)
+    result.at[row_index, "Jumlah"] = float(quantity * price)
+    result.at[row_index, "Jumlah Asli"] = 0.0
+    result.at[row_index, "Jumlah Usulan"] = float(
+        quantity * price
+    )
+    result.at[row_index, "Nama Nota"] = "Rekomendasi Database"
+    result.at[row_index, "Sumber"] = "Barang Baru Database"
+    result.at[row_index, "Product ID"] = replacement.get(
+        "product_id"
+    )
+    result.at[row_index, "Product Family"] = str(
+        replacement.get("product_family")
+        or get_product_family(
+            replacement.get("product_name") or ""
+        )
+    )
+    result.at[row_index, "Skor Rekomendasi"] = safe_float(
+        replacement.get("score")
+    )
+    result.at[row_index, "Alasan"] = str(
+        replacement.get("reason") or ""
+    )
+    result.at[row_index, "Batas Rekomendasi"] = int(
+        replacement.get("quantity_limit") or 10
+    )
+    result.at[row_index, "Wajib APD"] = bool(
+        replacement.get("is_mandatory")
+    )
+
+    result, rule_messages = apply_absolute_quantity_rules(
+        result
+    )
+    messages.extend(rule_messages)
+
+    current_total = float(
+        result["Jumlah Usulan"].sum()
+    )
+
+    # Bila pengganti membuat total melewati target, kurangi kuantitas
+    # baris pengganti selama masih memperbaiki jarak.
+    while (
+        current_total > target
+        and safe_float(
+            result.at[row_index, "Kuantitas Usulan"]
+        ) > 1
+    ):
+        current_quantity = safe_float(
+            result.at[row_index, "Kuantitas Usulan"]
+        )
+        current_gap = abs(target - current_total)
+        candidate_total = current_total - price
+        candidate_gap = abs(target - candidate_total)
+
+        if candidate_gap > current_gap:
+            break
+
+        new_quantity = current_quantity - 1
+        result.at[row_index, "Kuantitas"] = new_quantity
+        result.at[row_index, "Kuantitas Usulan"] = new_quantity
+        result.at[row_index, "Jumlah"] = (
+            new_quantity * price
+        )
+        result.at[row_index, "Jumlah Usulan"] = (
+            new_quantity * price
+        )
+        current_total = candidate_total
+
+    if current_total < target:
+        result, quantity_messages = increase_quantities(
+            result=result,
+            target=target,
+            max_quantity_increase=max_quantity_increase,
+        )
+        messages.extend(quantity_messages)
+
+        result, price_messages = increase_prices(
+            result=result,
+            target=target,
+            max_price_increase=max_price_increase,
+            rounding_step=rounding_step,
+        )
+        messages.extend(price_messages)
+
+        for _ in range(100):
+            current_total = float(
+                result["Jumlah Usulan"].sum()
+            )
+
+            if abs(target - current_total) <= tolerance:
+                break
+
+            previous_total = current_total
+
+            result, balance_message = precise_balance(
+                result=result,
+                target=target,
+                max_price_increase=max_price_increase,
+                max_quantity_increase=max_quantity_increase,
+                rounding_step=rounding_step,
+                tolerance=tolerance,
+            )
+
+            current_total = float(
+                result["Jumlah Usulan"].sum()
+            )
+
+            if current_total == previous_total:
+                messages.append(balance_message)
+                break
+
+    messages.insert(
+        0,
+        f"{old_name} diganti dengan "
+        f"{replacement.get('product_name')}.",
+    )
+
+    return result, messages
+
+
 def build_automatic_database_simulation(
     source: pd.DataFrame,
     invoice_id: str,
@@ -1027,6 +1222,10 @@ if "recommendation_refresh_seed" not in st.session_state:
 
 if "recommendation_excluded_ids" not in st.session_state:
     st.session_state.recommendation_excluded_ids = []
+
+
+if "single_replace_seed" not in st.session_state:
+    st.session_state.single_replace_seed = 0
 
 
 # =========================================================
@@ -1544,6 +1743,184 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
             }
 
             st.rerun()
+
+        st.markdown("#### Ganti Satu Barang Rekomendasi")
+
+        recommendation_rows_df = simulation_df[
+            simulation_df["Sumber"]
+            == "Barang Baru Database"
+        ].copy()
+
+        if recommendation_rows_df.empty:
+            st.caption(
+                "Belum ada barang rekomendasi yang dapat diganti."
+            )
+        else:
+            replacement_options = {
+                (
+                    f"{row['Uraian']} | "
+                    f"{rupiah(safe_float(row['Jumlah Usulan']))}"
+                ): int(idx)
+                for idx, row in recommendation_rows_df.iterrows()
+            }
+
+            selected_replacement_label = st.selectbox(
+                "Pilih barang rekomendasi yang ingin diganti",
+                options=list(replacement_options.keys()),
+                key="single_replacement_selector",
+            )
+
+            if st.button(
+                "🔁 Ganti Item Terpilih",
+                use_container_width=True,
+                help=(
+                    "Hanya item yang dipilih yang diganti. "
+                    "Rekomendasi lain tetap dipertahankan."
+                ),
+            ):
+                selected_row_index = replacement_options[
+                    selected_replacement_label
+                ]
+
+                selected_row = simulation_df.loc[
+                    selected_row_index
+                ]
+
+                visible_product_ids = {
+                    str(value)
+                    for value in recommendation_rows_df[
+                        "Product ID"
+                    ].dropna().tolist()
+                    if str(value).strip()
+                }
+
+                old_product_id = str(
+                    selected_row.get("Product ID") or ""
+                )
+
+                # Produk yang dipilih harus boleh diganti,
+                # jadi keluarkan ID-nya dari daftar visible.
+                visible_product_ids.discard(
+                    old_product_id
+                )
+
+                st.session_state.single_replace_seed += 1
+
+                try:
+                    with st.spinner(
+                        "Mencari satu barang pengganti..."
+                    ):
+                        replacement = (
+                            recommend_replacement_product(
+                                invoice_id=invoice_id,
+                                replaced_product_id=old_product_id,
+                                visible_product_ids=visible_product_ids,
+                                old_product_name=str(
+                                    selected_row.get("Uraian")
+                                    or ""
+                                ),
+                                old_category=str(
+                                    selected_row.get("Kategori")
+                                    or ""
+                                ),
+                                old_total=safe_float(
+                                    selected_row.get(
+                                        "Jumlah Usulan"
+                                    )
+                                ),
+                                random_seed=int(
+                                    st.session_state.single_replace_seed
+                                ),
+                            )
+                        )
+
+                    if not replacement:
+                        st.warning(
+                            "Belum ditemukan barang pengganti "
+                            "yang memenuhi aturan."
+                        )
+                    else:
+                        replaced_df, replace_messages = (
+                            replace_single_recommendation_row(
+                                simulation_df=simulation_df,
+                                row_index=selected_row_index,
+                                replacement=replacement,
+                                target=float(
+                                    simulation["target"]
+                                ),
+                                max_price_increase=float(
+                                    simulation[
+                                        "max_price_increase"
+                                    ]
+                                ),
+                                max_quantity_increase=float(
+                                    simulation[
+                                        "max_quantity_increase"
+                                    ]
+                                ),
+                                rounding_step=int(
+                                    simulation["rounding_step"]
+                                ),
+                                tolerance=float(
+                                    simulation["tolerance"]
+                                ),
+                            )
+                        )
+
+                        revised_total = float(
+                            replaced_df[
+                                "Jumlah Usulan"
+                            ].sum()
+                        )
+                        difference = (
+                            float(simulation["target"])
+                            - revised_total
+                        )
+
+                        recommended_product_ids = sorted({
+                            str(value)
+                            for value in replaced_df.loc[
+                                replaced_df["Sumber"]
+                                == "Barang Baru Database",
+                                "Product ID",
+                            ].dropna().tolist()
+                            if str(value).strip()
+                        })
+
+                        st.session_state.global_budget_simulation = {
+                            **simulation,
+                            "data": replaced_df.to_dict(
+                                "records"
+                            ),
+                            "revised_total": revised_total,
+                            "difference": difference,
+                            "reached": (
+                                abs(difference)
+                                <= float(
+                                    simulation["tolerance"]
+                                )
+                            ),
+                            "messages": (
+                                list(
+                                    simulation.get(
+                                        "messages",
+                                        [],
+                                    )
+                                )
+                                + replace_messages
+                            ),
+                            "recommended_product_ids": (
+                                recommended_product_ids
+                            ),
+                        }
+
+                        st.rerun()
+
+                except Exception as error:
+                    st.error(
+                        "Barang belum dapat diganti: "
+                        f"{error}"
+                    )
 
         category_summary = (
             simulation_df.groupby(
