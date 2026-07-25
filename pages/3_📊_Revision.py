@@ -519,8 +519,13 @@ def increase_prices(
     rounding_step: int,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
-    Prioritas ketiga:
-    naikkan harga secara terbatas, bukan proporsional tanpa batas.
+    Menaikkan harga secara merata pada seluruh barang yang tidak dikunci.
+
+    Alur:
+    1. Hitung persentase kenaikan bersama yang dibutuhkan.
+    2. Terapkan persentase yang sama ke semua item eligible.
+    3. Batasi kenaikan per item sesuai slider.
+    4. Lakukan koreksi nominal kecil secara berurutan agar lebih dekat target.
     """
 
     messages: list[str] = []
@@ -540,25 +545,27 @@ def increase_prices(
     if eligible.empty:
         return result, messages
 
-    eligible["Potensi Maksimal"] = (
-        eligible["Kuantitas Usulan"]
-        * eligible["Harga Usulan"]
-        * max_price_increase
-        / 100.0
+    eligible_value = float(
+        (
+            eligible["Kuantitas Usulan"]
+            * eligible["Harga Usulan"]
+        ).sum()
     )
 
-    eligible = eligible.sort_values(
-        by="Potensi Maksimal",
-        ascending=False,
-    )
+    if eligible_value <= 0:
+        return result, messages
 
-    total_added = 0.0
+    required_rate = gap / eligible_value
+    maximum_rate = max(float(max_price_increase), 0.0) / 100.0
+    applied_rate = min(required_rate, maximum_rate)
+
+    if applied_rate <= 0:
+        return result, messages
+
     changed_items = 0
+    total_added = 0.0
 
     for idx in eligible.index:
-        if gap <= 0:
-            break
-
         qty = safe_float(
             result.at[idx, "Kuantitas Usulan"]
         )
@@ -579,53 +586,112 @@ def increase_prices(
 
         max_allowed_price = round_to_step(
             reference_price
-            * (
-                1.0
-                + max_price_increase / 100.0
-            ),
+            * (1.0 + maximum_rate),
             rounding_step,
         )
 
-        max_allowed_price = max(
-            max_allowed_price,
-            current_price,
-        )
-
-        ideal_increment = gap / qty
-
-        candidate_price = round_to_step(
-            min(
-                current_price + ideal_increment,
-                max_allowed_price,
-            ),
+        proposed_price = round_to_step(
+            current_price * (1.0 + applied_rate),
             rounding_step,
         )
 
-        candidate_price = max(
+        proposed_price = max(
             current_price,
-            min(candidate_price, max_allowed_price),
+            min(proposed_price, max_allowed_price),
         )
 
         nominal = (
-            candidate_price - current_price
+            proposed_price - current_price
         ) * qty
 
         if nominal <= 0:
             continue
 
-        result.at[idx, "Harga Usulan"] = candidate_price
+        result.at[idx, "Harga Usulan"] = proposed_price
         result.at[idx, "Jumlah Usulan"] = (
-            qty * candidate_price
+            qty * proposed_price
         )
 
         total_added += nominal
-        gap -= nominal
         changed_items += 1
+
+    # Koreksi kecil setelah pembulatan.
+    remaining_gap = target - float(
+        result["Jumlah Usulan"].sum()
+    )
+
+    if remaining_gap > 0:
+        correction_candidates = result[
+            (~result["Kunci"])
+            & (result["Harga Usulan"] > 0)
+            & (result["Kuantitas Usulan"] > 0)
+        ].copy()
+
+        correction_candidates["Potensi Koreksi"] = (
+            correction_candidates["Kuantitas Usulan"]
+            * rounding_step
+        )
+
+        correction_candidates = correction_candidates.sort_values(
+            by="Potensi Koreksi",
+            ascending=True,
+        )
+
+        for idx in correction_candidates.index:
+            if remaining_gap <= 0:
+                break
+
+            qty = safe_float(
+                result.at[idx, "Kuantitas Usulan"]
+            )
+            original_price = safe_float(
+                result.at[idx, "Harga Asli"]
+            )
+            current_price = safe_float(
+                result.at[idx, "Harga Usulan"]
+            )
+
+            reference_price = max(
+                original_price,
+                current_price,
+            )
+
+            max_allowed_price = round_to_step(
+                reference_price
+                * (1.0 + maximum_rate),
+                rounding_step,
+            )
+
+            if current_price + rounding_step > max_allowed_price:
+                continue
+
+            nominal_step = qty * rounding_step
+
+            if nominal_step <= 0:
+                continue
+
+            current_gap = abs(remaining_gap)
+            candidate_gap = abs(
+                remaining_gap - nominal_step
+            )
+
+            if candidate_gap > current_gap:
+                continue
+
+            new_price = current_price + rounding_step
+            result.at[idx, "Harga Usulan"] = new_price
+            result.at[idx, "Jumlah Usulan"] = (
+                qty * new_price
+            )
+
+            total_added += nominal_step
+            remaining_gap -= nominal_step
 
     if changed_items:
         messages.append(
-            f"Harga {changed_items} barang dinaikkan secara terbatas "
-            f"dengan tambahan {rupiah(total_added)}."
+            f"Harga {changed_items} barang dinaikkan secara merata "
+            f"sekitar {applied_rate * 100:.2f}% dengan tambahan "
+            f"{rupiah(total_added)}."
         )
 
     return result, messages
@@ -1357,7 +1423,7 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
         max_price_increase = st.slider(
             "Maksimal kenaikan harga per barang",
             min_value=0,
-            max_value=100,
+            max_value=30,
             value=int(
                 DEFAULT_MAX_PRICE_INCREASE
             ),
