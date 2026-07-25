@@ -1013,6 +1013,36 @@ def replace_single_recommendation_row(
     return result, messages
 
 
+def get_recommended_product_ids(
+    dataframe: pd.DataFrame,
+) -> list[str]:
+    """
+    Mengambil Product ID barang rekomendasi secara aman.
+
+    Bila simulasi tidak menambahkan barang baru, kolom Product ID mungkin
+    belum terbentuk. Dalam kondisi tersebut fungsi mengembalikan list kosong.
+    """
+
+    required_columns = {
+        "Sumber",
+        "Product ID",
+    }
+
+    if not required_columns.issubset(dataframe.columns):
+        return []
+
+    values = dataframe.loc[
+        dataframe["Sumber"] == "Barang Baru Database",
+        "Product ID",
+    ].dropna().tolist()
+
+    return sorted({
+        str(value)
+        for value in values
+        if str(value).strip()
+    })
+
+
 def build_automatic_database_simulation(
     source: pd.DataFrame,
     invoice_id: str,
@@ -1175,14 +1205,9 @@ def build_automatic_database_simulation(
 
     reached = abs(difference) <= tolerance
 
-    recommended_product_ids = {
-        str(value)
-        for value in result.loc[
-            result["Sumber"] == "Barang Baru Database",
-            "Product ID",
-        ].dropna().tolist()
-        if str(value).strip()
-    }
+    recommended_product_ids = get_recommended_product_ids(
+        result
+    )
 
     return {
         "dataframe": result,
@@ -1198,7 +1223,7 @@ def build_automatic_database_simulation(
         "new_product_share": new_product_share,
         "rounding_step": rounding_step,
         "tolerance": tolerance,
-        "recommended_product_ids": sorted(
+        "recommended_product_ids": (
             recommended_product_ids
         ),
     }
@@ -1531,6 +1556,15 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
         simulation_df = pd.DataFrame(
             simulation["data"]
         )
+
+        for internal_column, default_value in {
+            "Product ID": None,
+            "Product Family": "",
+            "Batas Rekomendasi": 10,
+            "Wajib APD": False,
+        }.items():
+            if internal_column not in simulation_df.columns:
+                simulation_df[internal_column] = default_value
 
         result_1, result_2, result_3, result_4 = (
             st.columns(4)
@@ -1877,15 +1911,11 @@ if revision_mode == "🚀 Otomatis Cerdas dari Database":
                             - revised_total
                         )
 
-                        recommended_product_ids = sorted({
-                            str(value)
-                            for value in replaced_df.loc[
-                                replaced_df["Sumber"]
-                                == "Barang Baru Database",
-                                "Product ID",
-                            ].dropna().tolist()
-                            if str(value).strip()
-                        })
+                        recommended_product_ids = (
+                            get_recommended_product_ids(
+                                replaced_df
+                            )
+                        )
 
                         st.session_state.global_budget_simulation = {
                             **simulation,
